@@ -629,6 +629,7 @@ struct server_response {
         }
     }
 };
+
 struct server_context {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
@@ -3853,4 +3854,3 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
-
