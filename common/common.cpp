@@ -2945,6 +2945,9 @@ static llama_control_vector_data llama_control_vector_load_one(const llama_contr
         }
     }
 
+    gguf_free(ctx_gguf);
+    ggml_free(ctx);
+
     return result;
 }
 
