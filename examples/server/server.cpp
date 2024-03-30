@@ -29,6 +29,7 @@
 #include <thread>
 #include <signal.h>
 #include <memory>
+#include <dirent.h>
 
 using json = nlohmann::ordered_json;
 
@@ -2767,7 +2768,30 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                 fname += '/';
             if (is_dir && argv[i-1][slen - 1] != '/')
                 name += '/';
-            sparams.control_vector_load_options.push_back({ name, fname, is_dir });
+            if (is_dir) {
+              DIR *dir = opendir(fname.c_str());
+              if (dir == nullptr) {
+                fprintf(stderr, "error: could not read dir: %s\n", fname.c_str());
+              } else {
+                struct dirent* entry;
+                while ((entry = readdir(dir)) != nullptr) {
+                  std::string yomama = fname;
+                  if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                      continue;
+                  }
+                  // Print the name of the entry
+                  size_t yolen = strlen(entry->d_name);
+                  if (yolen >= 5 && strncmp(&entry->d_name[yolen -5 ], ".gguf", 5) == 0) {
+                    entry->d_name[yolen -5] = '\0';
+                    sparams.control_vector_load_options.push_back({ name + entry->d_name, fname + entry->d_name + ".gguf", false });
+                    std::cout << "vector option " << name + entry->d_name << " -> " << fname + entry->d_name << "\n";
+                  }
+                }
+              }
+            } else {
+              sparams.control_vector_load_options.push_back({ name, fname, is_dir });
+                    std::cout << "vector option " << name << " -> " << fname << "\n";
+            }
             break;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -3257,7 +3281,7 @@ int main(int argc, char ** argv) {
             for (const auto &item : data["vectors"]) {
                 llama_control_vector_load_info v = item.get<llama_control_vector_load_info>();
                 std::string real_fname = "";
-                std::cout << "Check vec " << v.fname << "\n";
+                //std::cout << "Check vec " << v.fname << "\n";
                 // check for path traversal attempt
                 if (v.fname.length() > 0 && v.fname[0] != '/' && v.fname[0] != '\\') {
                     if (v.fname.find("../") == -1 && v.fname.find("..\\") == -1 &&
@@ -3265,14 +3289,14 @@ int main(int argc, char ** argv) {
 
                         // check if vector name matches allowed names
                         for (auto opt : sparams.control_vector_load_options) {
-                            std::cout << "check option " << opt.name << " : " << opt.fname << " : " << opt.is_dir << "\n";
+                            //std::cout << "check option " << opt.name << " : " << opt.fname << " : " << opt.is_dir << "\n";
                             if (!opt.is_dir && opt.name == v.fname) {
-                                std::cout << "file exact match\n";
+                                //std::cout << "file exact match\n";
                                 real_fname = opt.fname;
                                 break;
                             }
                             if (opt.is_dir && v.fname.rfind(opt.name, 0) == 0) {
-                                std::cout << "file exact match\n";
+                                //std::cout << "file exact match\n";
                                 real_fname = opt.fname + v.fname.substr(opt.name.length());
 #if defined(_WIN32)
                                 std::replace(real_fname.begin(), real_fname.end(), '/', '\\');
