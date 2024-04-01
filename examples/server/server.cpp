@@ -845,6 +845,7 @@ struct server_context {
         slot.sparams.tfs_z             = json_value(data, "tfs_z",             default_sparams.tfs_z);
         slot.sparams.typical_p         = json_value(data, "typical_p",         default_sparams.typical_p);
         slot.sparams.temp              = json_value(data, "temperature",       default_sparams.temp);
+        slot.sparams.smoothing_factor  = json_value(data, "smoothing_factor",  default_sparams.smoothing_factor);
         slot.sparams.dynatemp_range    = json_value(data, "dynatemp_range",    default_sparams.dynatemp_range);
         slot.sparams.dynatemp_exponent = json_value(data, "dynatemp_exponent", default_sparams.dynatemp_exponent);
         slot.sparams.penalty_last_n    = json_value(data, "repeat_last_n",     default_sparams.penalty_last_n);
@@ -1264,6 +1265,7 @@ struct server_context {
             {"model",                     params.model_alias},
             {"seed",                      slot.params.seed},
             {"temperature",               slot.sparams.temp},
+            {"smoothing_factor",          slot.sparams.smoothing_factor},
             {"dynatemp_range",            slot.sparams.dynatemp_range},
             {"dynatemp_exponent",         slot.sparams.dynatemp_exponent},
             {"top_k",                     slot.sparams.top_k},
@@ -2276,10 +2278,7 @@ struct server_context {
                 }
 
                 for (size_t i = 0; i < std::min(cur_p.size, (size_t) n_probs); ++i) {
-                    result.probs.push_back({
-                        cur_p.data[i].id,
-                        cur_p.data[i].p
-                    });
+                    result.probs.push_back(cur_p.data[i]);
                 }
 
                 if (!process_token(result, slot)) {

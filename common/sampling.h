@@ -30,6 +30,7 @@ typedef struct llama_sampling_params {
     float       tfs_z                 = 1.00f;              // 1.0 = disabled
     float       typical_p             = 1.00f;              // 1.0 = disabled
     float       temp                  = 0.80f;              // <= 0.0 to sample greedily, 0.0 to not output probabilities
+    float       smoothing_factor      = 0;        // snot
     float       dynatemp_range        = 0.00f;              // 0.0 = disabled
     float       dynatemp_exponent     = 1.00f;              // controls how entropy maps to temperature in dynamic temperature sampler
     int32_t     penalty_last_n        = 64;                 // last n tokens to penalize (0 = disable penalty, -1 = context size)
@@ -41,6 +42,7 @@ typedef struct llama_sampling_params {
     float       mirostat_eta          = 0.10f;              // learning rate
     bool        penalize_nl           = false;              // consider newlines as a repeatable token
     uint32_t    seed                  = LLAMA_DEFAULT_SEED; // the seed used to initialize llama_sampling_context
+
 
     std::vector<llama_sampler_type> samplers_sequence = {
         llama_sampler_type::TOP_K,

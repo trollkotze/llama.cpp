@@ -309,12 +309,9 @@ struct completion_token_output {
     llama_token tok;
     std::string text_to_send;
 
-    struct token_prob {
-        llama_token tok;
-        float prob;
-    };
+    llama_token_data token_prob;
 
-    std::vector<token_prob> probs;
+    std::vector<llama_token_data> probs;
 };
 
 // convert a vector of completion_token_output to json
@@ -325,10 +322,11 @@ static json probs_vector_to_json(const llama_context * ctx, const std::vector<co
         json probs_for_token = json::array();
 
         for (const auto & p : prob.probs) {
-            const std::string tok_str = tokens_to_output_formatted_string(ctx, p.tok);
+            const std::string tok_str = tokens_to_output_formatted_string(ctx, p.id);
             probs_for_token.push_back(json {
                 {"tok_str", tok_str},
-                {"prob",    p.prob},
+                {"prob",    p.p},
+                {"logit",   p.logit},
             });
         }
 

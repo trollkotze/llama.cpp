@@ -13489,7 +13489,7 @@ void llama_sample_typical(struct llama_context * ctx, llama_token_data_array * c
     }
 }
 
-void llama_sample_entropy(struct llama_context * ctx, llama_token_data_array * candidates_p, float min_temp, float max_temp, float exponent_val) {
+void llama_sample_entropy(struct llama_context * ctx, llama_token_data_array * candidates_p, float min_temp, float max_temp, float exponent_val, float smoothing_factor) {
     const int64_t t_start_sample_us = ggml_time_us();
 
     // no need to do anything if there is only one (or zero) candidates
@@ -13551,16 +13551,49 @@ void llama_sample_entropy(struct llama_context * ctx, llama_token_data_array * c
     }
 #endif
 
+    // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
+    if (smoothing_factor > 0 && candidates_p->size > 1) {
+        printf("Entropy: Apply the snoot! %d %.3f\n", candidates_p->size, smoothing_factor);
+
+        llama_sample_softmax(ctx, candidates_p);
+        float h = candidates_p->data[0].logit; // Find the maximum logit for h to be added after the transformation
+        // Apply quadratic transformation using the smoothing_factor
+        for (size_t i = 0; i < candidates_p->size; ++i)
+        {
+            float logit_shifted = candidates_p->data[i].logit - h;
+            candidates_p->data[i].logit = -smoothing_factor * logit_shifted * logit_shifted + h;
+        }
+        llama_sample_softmax(ctx, candidates_p);
+    } else {
+      printf("Entropy: No snoot today %d %.3f\n", candidates_p->size, smoothing_factor);
+    }
     if (ctx) {
         ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
     }
 }
 
-void llama_sample_temp(struct llama_context * ctx, llama_token_data_array * candidates_p, float temp) {
+void llama_sample_temp(struct llama_context * ctx, llama_token_data_array * candidates_p, float temp, float smoothing_factor) {
     const int64_t t_start_sample_us = ggml_time_us();
 
     for (size_t i = 0; i < candidates_p->size; ++i) {
         candidates_p->data[i].logit /= temp;
+    }
+
+    // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
+    if (smoothing_factor > 0 && candidates_p->size > 1) {
+        printf("Temp: Apply the snoot! %d %.3f\n", candidates_p->size, smoothing_factor);
+
+        llama_sample_softmax(ctx, candidates_p);
+        float h = candidates_p->data[0].logit; // Find the maximum logit for h to be added after the transformation
+        // Apply quadratic transformation using the smoothing_factor
+        for (size_t i = 0; i < candidates_p->size; ++i)
+        {
+            float logit_shifted = candidates_p->data[i].logit - h;
+            candidates_p->data[i].logit = -smoothing_factor * logit_shifted * logit_shifted + h;
+        }
+        llama_sample_softmax(ctx, candidates_p);
+    } else {
+      printf("Temp: No snoot today %d %.3f\n", candidates_p->size, smoothing_factor);
     }
 
     if (ctx) {

@@ -185,7 +185,7 @@ int main(int argc, char ** argv) {
 
             llama_sample_top_k(ctx, &candidates_p, top_k, 1);
             llama_sample_top_p(ctx, &candidates_p, top_p, 1);
-            llama_sample_temp (ctx, &candidates_p, temp);
+            llama_sample_temp (ctx, &candidates_p, temp, 0);
 
             const llama_token new_token_id = llama_sample_token(ctx, &candidates_p);
 

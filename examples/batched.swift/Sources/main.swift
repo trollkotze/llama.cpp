@@ -146,7 +146,7 @@ while n_cur <= n_len {
 
         llama_sample_top_k(context, &candidates_p, top_k, 1)
         llama_sample_top_p(context, &candidates_p, top_p, 1)
-        llama_sample_temp(context, &candidates_p, temp)
+        llama_sample_temp(context, &candidates_p, temp, 0)
 
         let new_token_id = llama_sample_token(context, &candidates_p)
 
