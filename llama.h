@@ -57,6 +57,8 @@ extern "C" {
 
     struct llama_model;
     struct llama_context;
+    struct llama_control_vector;
+    struct llama_control_vector* get_llama_control_vector(struct llama_context* context);
 
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
@@ -485,7 +487,9 @@ extern "C" {
                          int32_t   n_embd,
                          int32_t   il_start,
                          int32_t   il_end);
+    LLAMA_API int32_t llama_control_vector_apply_ensemble(struct llama_context * lctx, struct llama_control_vector_ensemble_data *cvec_ensemble, int32_t il_start, int32_t il_end);
 
+    LLAMA_API void llama_fugg(struct llama_context * lctx, char *f);
     //
     // KV cache
     //

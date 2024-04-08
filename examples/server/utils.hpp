@@ -305,11 +305,20 @@ static std::string tokens_to_output_formatted_string(const llama_context * ctx, 
     return out;
 }
 
+
+struct cos_sim_component {
+  std::string fname;
+  float value;
+};
+
 struct completion_token_output {
     llama_token tok;
     std::string text_to_send;
 
     llama_token_data token_prob;
+
+    float cos_sim_total;
+    std::vector<cos_sim_component> cos_sim_components;
 
     std::vector<llama_token_data> probs;
 };
@@ -334,6 +343,21 @@ static json probs_vector_to_json(const llama_context * ctx, const std::vector<co
         out.push_back(json {
             {"content", tok_str},
             {"probs",   probs_for_token},
+        });
+    }
+
+    return out;
+}
+
+
+// convert a vector of completion_token_output to json
+static json cos_sim_components_to_json(std::vector<cos_sim_component> &cscs) {
+    json out = json::array();
+
+    for (const auto & csc : cscs) {
+        out.push_back(json {
+            {"fname", csc.fname},
+            {"value",   csc.value},
         });
     }
 

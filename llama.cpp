@@ -109,6 +109,46 @@
 #define LLAMA_MAX_EXPERTS 60
 
 //
+// Control vector utils
+//
+
+struct llama_control_vector_component {
+  int n_embd;
+  std::vector<float> data;
+  float strength;
+  std::string fname;
+  float tally_mag;
+  float tally_prod;
+  std::vector<float> cos_sim;
+};
+
+struct llama_control_vector_data {
+    int n_embd;
+
+    // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
+    std::vector<float> data;
+};
+
+struct llama_control_vector_ensemble_data {
+    int n_embd;
+
+    // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
+    std::vector<float> data;
+    float tally_mag;
+    float tally_prod;
+    std::vector<float> cos_sim;
+
+    std::vector<llama_control_vector_component> components;
+};
+
+
+struct llama_control_vector_load_info {
+    float strength;
+
+    std::string fname;
+};
+
+//
 // logging
 //
 
@@ -2333,6 +2373,9 @@ struct llama_context {
 #endif
 };
 
+struct llama_control_vector* get_llama_control_vector(struct llama_context* context) {
+  return &context->cvec;
+}
 //
 // kv cache helpers
 //
@@ -11555,6 +11598,7 @@ static int llama_decode_internal(
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
                     {
+                      printf("pooling type none\n");
                         // extract token embeddings
                         GGML_ASSERT(lctx.embd != nullptr);
                         float * embd_out = lctx.embd + n_outputs_prev*n_embd;
@@ -11567,8 +11611,10 @@ static int llama_decode_internal(
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_CLS:
+                      printf("pooling type cls\n");
                 case LLAMA_POOLING_TYPE_MEAN:
                     {
+                      printf("pooling type mean\n");
                         GGML_ASSERT(strcmp(embd->name, "result_embd_pooled") == 0);
 
                         // extract sequence embeddings
@@ -16037,7 +16083,28 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
     fprintf(stderr, "control vector init took %ums\n", end - start);
     return true;
 }
+void llama_fugg(struct llama_context *lctx, char *f) {
 
+    char fuggoffb[64];
+    sprintf(fuggoffb, "yeah%s", f);
+    const llama_model & model = lctx->model;
+    llama_control_vector & cvec = lctx->cvec;
+    int fuggsize = model.hparams.n_embd * (model.hparams.n_layer -1);
+    printf("fugg size %d\n", fuggsize);
+    float *fugg = new float[fuggsize];
+    for (size_t il = 1; il < model.hparams.n_layer; il++) {
+        assert(cvec.tensors[il] != nullptr);
+        const size_t off = model.hparams.n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
+        ggml_backend_tensor_get(cvec.tensors[il], fugg + off, 0, model.hparams.n_embd * ggml_element_size(cvec.tensors[il]));
+    }
+    FILE *fuggyou = fopen(fuggoffb, "w");
+    for (size_t i=0; i<fuggsize; i++) {
+      fprintf(fuggyou, " %.3f", fugg[i]);
+    }
+    fprintf(fuggyou, "\n");
+    fclose(fuggyou);
+    delete[] fugg;
+}
 int32_t llama_control_vector_apply(struct llama_context * lctx, const float * data, size_t len, int32_t n_embd, int32_t il_start, int32_t il_end) {
     auto start = ggml_time_ms();
     printf("control vector apply...\n");
@@ -16076,7 +16143,53 @@ int32_t llama_control_vector_apply(struct llama_context * lctx, const float * da
             ggml_backend_tensor_set(cvec.tensors[il], data + off, 0, n_embd * ggml_element_size(cvec.tensors[il]));
         }
     }
+    auto end = ggml_time_ms();
+    printf("control vector apply took %ums\n", end - start);
+    return 0;
+}
 
+
+int32_t llama_control_vector_apply_ensemble(struct llama_context * lctx, struct llama_control_vector_ensemble_data *cvec_ensemble, int32_t il_start, int32_t il_end) {
+    const float * data = cvec_ensemble->data.data();
+    size_t len = cvec_ensemble->data.size();
+    int32_t n_embd = cvec_ensemble->n_embd;
+    auto start = ggml_time_ms();
+    printf("control vector apply...\n");
+    const llama_model & model = lctx->model;
+    llama_control_vector & cvec = lctx->cvec;
+
+    if (data == nullptr) {
+        // disable the current control vector (but leave allocated for later)
+        cvec.layer_start = -1;
+        cvec.layer_end   = -1;
+        auto end = ggml_time_ms();
+        printf("control vector apply took %ums\n", end - start);
+        return 0;
+    }
+
+    if (n_embd != (int) model.hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: control vector n_embd does not match model\n", __func__);
+        return 1;
+    }
+
+    if (cvec.tensors.empty()) {
+        if (!llama_control_vector_init(cvec, model)) {
+            LLAMA_LOG_ERROR("%s: control vector init failed\n", __func__);
+            return 1;
+        }
+    }
+
+    cvec.layer_start = il_start;
+    cvec.layer_end   = il_end;
+
+    for (size_t il = 1; il < model.hparams.n_layer; il++) {
+        assert(cvec.tensors[il] != nullptr);
+
+        const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
+        if (off + n_embd <= len) {
+            ggml_backend_tensor_set(cvec.tensors[il], data + off, 0, n_embd * ggml_element_size(cvec.tensors[il]));
+        }
+    }
     auto end = ggml_time_ms();
     printf("control vector apply took %ums\n", end - start);
     return 0;

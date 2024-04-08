@@ -309,12 +309,37 @@ float llama_embd_similarity_cos(const float * embd1, const float * embd2, int n)
 // Control vector utils
 //
 
+struct llama_control_vector_component {
+  int n_embd;
+  std::vector<float> data;
+  float strength;
+  std::string fname;
+  float tally_mag;
+  float tally_prod;
+  float cos_sim_total;
+  std::vector<float> cos_sim;
+};
+
 struct llama_control_vector_data {
     int n_embd;
 
     // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
     std::vector<float> data;
 };
+
+struct llama_control_vector_ensemble_data {
+    int n_embd;
+
+    // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
+    std::vector<float> data;
+    float tally_mag;
+    float tally_prod;
+    float cos_sim_total;
+    std::vector<float> cos_sim;
+
+    std::vector<llama_control_vector_component> components;
+};
+
 
 struct llama_control_vector_load_info {
     float strength;
@@ -325,7 +350,7 @@ struct llama_control_vector_load_info {
 // Load control vectors, scale each by strength, and add them together.
 // On error, returns {-1, empty}
 llama_control_vector_data llama_control_vector_load(const std::vector<llama_control_vector_load_info> & load_infos);
-
+llama_control_vector_ensemble_data llama_control_vector_load_ensemble(const std::vector<llama_control_vector_load_info> & load_infos, const std::vector<llama_control_vector_load_info> & load_infos_asdf);
 //
 // Split utils
 //
