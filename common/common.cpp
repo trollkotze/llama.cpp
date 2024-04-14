@@ -2926,7 +2926,8 @@ static llama_control_vector_data llama_control_vector_load_one(const llama_contr
     }
 
     // do not store data for layer 0 (it's not used)
-    result.data.resize(result.n_embd * max_direction_layer);
+    if (result.data.size() != result.n_embd * max_direction_layer)
+      result.data.resize(result.n_embd * max_direction_layer);
 
     for (uint32_t il = 1; il <= max_direction_layer; il++) {
         const std::string name = "direction." + std::to_string(il);
@@ -2989,7 +2990,7 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
 }
 
 
-static llama_control_vector_component llama_control_vector_load_component(const llama_control_vector_load_info & load_info) {
+static llama_control_vector_component &llama_control_vector_load_component(const llama_control_vector_load_info & load_info, llama_control_vector_component &result) {
     auto start = ggml_time_ms();
     printf("control vector load_one...\n");
     int32_t n_tensors;
@@ -2997,8 +2998,6 @@ static llama_control_vector_component llama_control_vector_load_component(const 
     size_t n_bytes = 0;
 
     uint32_t max_direction_layer = 0;
-
-    llama_control_vector_component result = { -1, {}, load_info.strength, load_info.fname };
 
     // calculate size of ctx needed for tensors, ensure tensors are f32, and find max layer
     {
@@ -3107,48 +3106,44 @@ static llama_control_vector_component llama_control_vector_load_component(const 
     return result;
 }
 
-llama_control_vector_ensemble_data llama_control_vector_load_ensemble(const std::vector<llama_control_vector_load_info> & load_infos, const std::vector<llama_control_vector_load_info> & load_infos_asdf) {
+llama_control_vector_ensemble_data & llama_control_vector_load_ensemble(llama_control_vector_ensemble_data &result, const std::vector<llama_control_vector_load_info> & load_infos, const std::vector<llama_control_vector_load_info> & load_infos_asdf) {
     auto start = ggml_time_ms();
     printf("control vector load...\n");
-    llama_control_vector_ensemble_data result = { -1, {} };
 
-    int i = 0;
-    for (const auto & info : load_infos) {
-      if (info.strength != 0.0f) {
-        llama_control_vector_component cur = llama_control_vector_load_component(info);
-        cur.fname = load_infos_asdf[i].fname;
-
-        if (cur.n_embd == -1) {
-            return result;
-        }
-        if (result.n_embd != -1 && (result.n_embd != cur.n_embd || result.data.size() != cur.data.size())) {
-            printf("%s: control vector in %s does not match previous vector dimensions\n", __func__, info.fname.c_str());
-            return result;
-        }
-
-        result.components.push_back(cur);
-        if (result.n_embd == -1) {
-            result.data.resize(cur.data.size(), 0);
-            result.n_embd = cur.n_embd;
-        }
-        for (size_t i = 0; i < cur.data.size(); i++) {
-            result.data[i] += cur.strength * cur.data[i];
-        }
-        /*
-        if (&info == &load_infos.back()) {
-          FILE *fuggyou = fopen("fuggload", "w");
-          //fprintf(fuggyou, "control vector loaded size (in floats): %.3d\n", cur.data.size());
-          printf("control vector loaded size (in floats): %d\n", cur.data.size());
-          //fprintf(fuggyou, "control vector loaded data: ");
-          for (size_t i = 0; i < cur.data.size(); i++) {
-              //printf(" %.3f", result.data[i]);
-              fprintf(fuggyou, " %.3f", result.data[i]);
-          }
-          fprintf(fuggyou, "\n");
-          fclose(fuggyou);
-        }*/
+    if (load_infos.size() > 0) {
+      if (result.components.size() < load_infos.size()) {
+        result.components.resize(load_infos.size());
       }
-      i++;
+      int i = 0;
+      for (const auto & info : load_infos) {
+        //if (info.strength != 0.0f) {
+          result.components[i].n_embd = -1;
+          result.components[i].strength = info.strength;
+          result.components[i].fname = info.fname;
+          llama_control_vector_component &cur = llama_control_vector_load_component(info, result.components[i]);
+          cur.fname = load_infos_asdf[i].fname;
+
+          if (cur.n_embd == -1) {
+              return result;
+          }
+          if (result.n_embd != -1 && (result.n_embd != cur.n_embd || result.data.size() != cur.data.size())) {
+              printf("%s: control vector in %s does not match previous vector dimensions\n", __func__, info.fname.c_str());
+              return result;
+          }
+
+          if (result.n_embd == -1 && result.data.size() != cur.data.size()) {
+              result.data.resize(cur.data.size(), 0);
+              result.n_embd = cur.n_embd;
+          }
+          if (i > 0)
+          for (size_t i = 0; i < cur.data.size(); i++) {
+            result.data[i] += cur.strength * cur.data[i];
+          } else {
+            result.data[i] = cur.strength * cur.data[i];
+          }
+        //}
+        i++;
+      }
     }
 
     if (result.n_embd == -1) {

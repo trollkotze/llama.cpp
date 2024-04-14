@@ -119,7 +119,12 @@ struct llama_control_vector_component {
   std::string fname;
   float tally_mag;
   float tally_prod;
+  float cos_sim_total;
   std::vector<float> cos_sim;
+  float b_tally_mag;
+  float b_tally_prod;
+  float b_cos_sim_total;
+  std::vector<float> b_cos_sim;
 };
 
 struct llama_control_vector_data {
@@ -136,7 +141,12 @@ struct llama_control_vector_ensemble_data {
     std::vector<float> data;
     float tally_mag;
     float tally_prod;
+    float cos_sim_total;
     std::vector<float> cos_sim;
+    float b_tally_mag;
+    float b_tally_prod;
+    float b_cos_sim_total;
+    std::vector<float> b_cos_sim;
 
     std::vector<llama_control_vector_component> components;
 };

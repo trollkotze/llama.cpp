@@ -318,6 +318,10 @@ struct llama_control_vector_component {
   float tally_prod;
   float cos_sim_total;
   std::vector<float> cos_sim;
+  float b_tally_mag;
+  float b_tally_prod;
+  float b_cos_sim_total;
+  std::vector<float> b_cos_sim;
 };
 
 struct llama_control_vector_data {
@@ -336,6 +340,10 @@ struct llama_control_vector_ensemble_data {
     float tally_prod;
     float cos_sim_total;
     std::vector<float> cos_sim;
+    float b_tally_mag;
+    float b_tally_prod;
+    float b_cos_sim_total;
+    std::vector<float> b_cos_sim;
 
     std::vector<llama_control_vector_component> components;
 };
@@ -350,7 +358,7 @@ struct llama_control_vector_load_info {
 // Load control vectors, scale each by strength, and add them together.
 // On error, returns {-1, empty}
 llama_control_vector_data llama_control_vector_load(const std::vector<llama_control_vector_load_info> & load_infos);
-llama_control_vector_ensemble_data llama_control_vector_load_ensemble(const std::vector<llama_control_vector_load_info> & load_infos, const std::vector<llama_control_vector_load_info> & load_infos_asdf);
+llama_control_vector_ensemble_data & llama_control_vector_load_ensemble(llama_control_vector_ensemble_data &result, const std::vector<llama_control_vector_load_info> & load_infos, const std::vector<llama_control_vector_load_info> & load_infos_asdf);
 //
 // Split utils
 //

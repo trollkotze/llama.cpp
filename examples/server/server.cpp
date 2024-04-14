@@ -32,7 +32,7 @@
 #include <dirent.h>
 
 using json = nlohmann::ordered_json;
-llama_control_vector_ensemble_data cvec;
+llama_control_vector_ensemble_data cvec = { -1, {} };
 bool server_verbose = false;
 bool server_log_json = true;
 
@@ -248,13 +248,18 @@ struct eval_callback_state {
     llama_control_vector *cvec;
     llama_context *ctx;
     bool wrong = false;
+    bool bwrong = false;
     float state[8192];
+    float bstate[8192];
 };
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+  //ffn_out
     struct eval_callback_state * eval_state = (eval_callback_state *)user_data;
+    bool is_l_out = strncmp(t->name, "l_out-", 6) == 0 && t->name[6] != '0';
+    bool is_ffn_out = strncmp(t->name, "ffn_out-", 6) == 0 && t->name[6] != '0';
     if (ask) {
         // Report whether we want to observe this tensor.
-        if (strncmp(t->name, "l_out-", 6) == 0 && t->name[6] != '0') {
+        if (is_l_out || is_ffn_out) {
             printf("Want to observe %s yo\n", t->name);
             for (int i = 0; i < GGML_MAX_DIMS; ++i) {
               printf("%d ", t->ne[i]);
@@ -262,6 +267,11 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             printf("\n");
             return true;
         } else {
+            printf("Don't care about this shit: %s ", t->name);
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+              printf("%d ", t->ne[i]);
+            }
+            printf("\n");
             return false;
         }
     } else {
@@ -273,19 +283,28 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         printf("\n");
         int idx = atoi(&t->name[6]);
         if (idx == 1) {
-          eval_state->wrong = false;
+          if (is_l_out)
+            eval_state->wrong = false;
+          else
+            eval_state->bwrong = false;
         }
-        if (eval_state->wrong) {
+        if (is_l_out && eval_state->wrong || !is_l_out && eval_state->bwrong) {
           printf("We were wrong.\n");
           return true;
         }
         if (eval_state == nullptr) {
           printf("eval_state ptr is null\n");
-          eval_state->wrong = true;
+          if (is_l_out)
+            eval_state->wrong = true;
+          else
+            eval_state->bwrong = true;
           return true;
         }
         if (eval_state->cvec == nullptr) {
-          printf("cvec ptr is null\n");
+          if (is_l_out)
+            eval_state->wrong = true;
+          else
+            eval_state->bwrong = true;
           eval_state->wrong = true;
           return true;
         }
@@ -295,37 +314,55 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
           eval_state->cvec->layer_start >= eval_state->cvec->layer_end
         ) {
           printf("vec layer range not mkay %d %d\n", eval_state->cvec->layer_start, eval_state->cvec->layer_end);
-          eval_state->wrong = true;
+          if (is_l_out)
+            eval_state->wrong = true;
+          else
+            eval_state->bwrong = true;
           return true;
         }
         size_t nlayers = eval_state->cvec->tensors.size();
         size_t tsize = t->ne[0];
         if (nlayers <= idx) {
           printf("the universe has collapsed, bro: %d < %d\n", nlayers, idx);
-          eval_state->wrong = true;
+          if (is_l_out)
+            eval_state->wrong = true;
+          else
+            eval_state->bwrong = true;
           return true;
         }
         bool wrong = false;
-        eval_state->wrong = false;
+        if (is_l_out)
+          eval_state->wrong = false;
+        else
+          eval_state->bwrong = false;
         bool toomany = false;
         auto cvec_tensor = eval_state->cvec->tensors[idx];
         printf("cvec %s dimensions:", cvec_tensor->name);
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
           printf(" %d", cvec_tensor->ne[i]);
           if (cvec_tensor->ne[i] != t->ne[i])
-            wrong = true;
+            if (is_l_out)
+              eval_state->wrong = true;
+            else
+              eval_state->bwrong = true;
           if (i > 0 && cvec_tensor->ne[i] > 1)
             toomany = true;
         }
         printf("\n");
         if (wrong) {
           printf("wrong dimensions\n");
-          eval_state->wrong = true;
+          if (is_l_out)
+            eval_state->wrong = true;
+          else
+            eval_state->bwrong = true;
           return true;
         }
         if (toomany) {
           printf("too many dimensions\n");
-          eval_state->wrong = true;
+          if (is_l_out)
+            eval_state->wrong = true;
+          else
+            eval_state->bwrong = true;
           return true;
         }
         int s1 = ggml_element_size(t);
@@ -339,97 +376,183 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
           printf("tensor size %d =?= %d: %s\n", s1, s2, s1 == s2 ? "yes" : "no");
           printf("tensor type %d =?= %d: %s\n", t1, t2, t1 == t2 ? "yes" : "no");
           printf("tensor nbytes %d =?= %d: %s\n", n1, n2, n1 == n2 ? "yes" : "no");
-          eval_state->wrong = true;
+          if (is_l_out)
+            eval_state->wrong = true;
+          else
+            eval_state->bwrong = true;
           return true;
         }
         //printf("dimension check: %d %d\n", s1, t->ne[0]);
         //GGML_ASSERT((s1 == 4 && t->ne[0] == 8192 && eval_state->cvec->tensors.size() == 80));
         printf("get the fucking tensor\n");
-        float *state = eval_state->state;
+        float *state = is_l_out ? eval_state->state : eval_state->bstate;
         ggml_backend_tensor_get(t, state, 0, s1 * tsize);
         printf("got the fucking tensor\n");
         float mag_state = 0.0f;
-        cvec.tally_mag = 0.0f;
-        cvec.tally_prod = 0.0f;
-        for (auto &comp : cvec.components) {
-          comp.tally_mag = 0.0f;
-          comp.tally_prod = 0.0f;
-          printf("comp[%s]: %.3f\n", comp.fname.c_str(), comp.strength);
-        }
-        printf("initialized the tallies, yo\n");
-
-        int offset = (idx-1)*tsize;
-        for (int i = 0; i < tsize; i++) {
-          mag_state += state[i]*state[i];
-
-          float cv_total = cvec.data[i + offset];
-          cvec.tally_mag += cv_total * cv_total;
-          cvec.tally_prod += cv_total * state[i];
+        if (is_l_out) {
+          cvec.tally_mag = 0.0f;
+          cvec.tally_prod = 0.0f;
           for (auto &comp : cvec.components) {
-            if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-              float cv_comp = comp.data[i + offset];
-              comp.tally_mag += cv_comp * cv_comp;
-              comp.tally_prod += cv_comp * state[i];
+            comp.tally_mag = 0.0f;
+            comp.tally_prod = 0.0f;
+            printf("comp[%s]: %.3f\n", comp.fname.c_str(), comp.strength);
+          }
+          printf("initialized the tallies, yo\n");
+
+          int offset = (idx-1)*tsize;
+          for (int i = 0; i < tsize; i++) {
+            mag_state += state[i]*state[i];
+
+            float cv_total = cvec.data[i + offset];
+            cvec.tally_mag += cv_total * cv_total;
+            cvec.tally_prod += cv_total * state[i];
+            for (auto &comp : cvec.components) {
+              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+                float cv_comp = comp.data[i + offset];
+                comp.tally_mag += cv_comp * cv_comp;
+                comp.tally_prod += cv_comp * state[i];
+              //}
             }
           }
-        }
 
-        printf("tallied the tallies, yo\n");
-        printf("mag_state: %.3f\n", mag_state);
-        printf("cvec.tally_mag: %.3f\n", cvec.tally_mag);
-        printf("cvec.tally_prod: %.3f\n", cvec.tally_prod);
-        for (auto &comp : cvec.components) {
-          if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-            printf("comp[%s].tally_mag: %.3f\n", comp.fname.c_str(), comp.tally_mag);
-            printf("comp[%s].tally_prod: %.3f\n", comp.fname.c_str(), comp.tally_prod);
-          } else {
-            printf("comp[%s].tally_mag: SHIT %.3f\n", comp.fname.c_str(), comp.tally_mag);
-            printf("comp[%s].tally_prod: SHIT %.3f\n", comp.fname.c_str(), comp.tally_prod);
-          }
-        }
-
-        cvec.tally_prod /= sqrt(cvec.tally_mag * mag_state);
-        if (cvec.cos_sim.size() < idx) {
-          cvec.cos_sim.push_back(cvec.tally_prod);
-        } else {
-          cvec.cos_sim[idx-1] = cvec.tally_prod;
-        }
-        printf("similarty [%s ~ %s] = %.3f\n", t->name, cvec_tensor->name, cvec.tally_prod);
-        for (auto &comp : cvec.components) {
-          if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-            comp.tally_prod /= sqrt(comp.tally_mag * mag_state);
-            if (comp.cos_sim.size() < idx) {
-              comp.cos_sim.push_back(comp.tally_prod);
+          printf("tallied the tallies, yo\n");
+          printf("mag_state: %.3f\n", mag_state);
+          printf("cvec.tally_mag: %.3f\n", cvec.tally_mag);
+          printf("cvec.tally_prod: %.3f\n", cvec.tally_prod);
+          for (auto &comp : cvec.components) {
+            if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+              printf("comp[%s].tally_mag: %.3f\n", comp.fname.c_str(), comp.tally_mag);
+              printf("comp[%s].tally_prod: %.3f\n", comp.fname.c_str(), comp.tally_prod);
             } else {
-              comp.cos_sim[idx-1] = comp.tally_prod;
+              printf("comp[%s].tally_mag: SHIT %.3f\n", comp.fname.c_str(), comp.tally_mag);
+              printf("comp[%s].tally_prod: SHIT %.3f\n", comp.fname.c_str(), comp.tally_prod);
             }
-            printf("similarty [%s ~ %s] = %.3f\n", t->name, comp.fname.c_str(), comp.tally_prod);
+          }
+
+          cvec.tally_prod /= sqrt(cvec.tally_mag * mag_state);
+          if (cvec.cos_sim.size() < idx) {
+            cvec.cos_sim.push_back(cvec.tally_prod);
           } else {
-            printf("similarty [%s ~ %s] = SHIT %.3f\n", t->name, comp.fname.c_str(), comp.strength);
+            cvec.cos_sim[idx-1] = cvec.tally_prod;
           }
-        }
-        if (idx == nlayers - 1) {
-          float tally = 0.0f;
-          for (int i=1; i<nlayers; i++) {
-            tally += cvec.cos_sim[i-1];
-          }
-          cvec.cos_sim_total = tally / (nlayers - 1);
-          printf("\n====== AVERAGE SIMILARITY ======\n");
-          printf("Total: %.3f\n", cvec.cos_sim_total);
+          printf("similarty [%s ~ %s] = %.3f\n", t->name, cvec_tensor->name, cvec.tally_prod);
           for (auto &comp : cvec.components) {
-            if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-              tally = 0.0f;
-              for (int i=1; i<nlayers; i++) {
-                tally += comp.cos_sim[i-1];
+            //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+              comp.tally_prod /= sqrt(comp.tally_mag * mag_state);
+              if (comp.cos_sim.size() < idx) {
+                comp.cos_sim.push_back(comp.tally_prod);
+              } else {
+                comp.cos_sim[idx-1] = comp.tally_prod;
               }
-              comp.cos_sim_total = tally / (nlayers - 1);
-              printf("%s (%.2f): %.3f\n", comp.fname.c_str(), comp.strength, comp.cos_sim_total);
+              printf("similarty [%s ~ %s] = %.3f\n", t->name, comp.fname.c_str(), comp.tally_prod);
+            /*} else {
+              printf("similarty [%s ~ %s] = SHIT %.3f\n", t->name, comp.fname.c_str(), comp.strength);
+            }*/
+          }
+          if (idx == nlayers - 1) {
+            float tally = 0.0f;
+            for (int i=1; i<nlayers; i++) {
+              tally += cvec.cos_sim[i-1];
+            }
+            cvec.cos_sim_total = tally / (nlayers - 1);
+            printf("\n====== AVERAGE SIMILARITY ======\n");
+            printf("Total: %.3f\n", cvec.cos_sim_total);
+            for (auto &comp : cvec.components) {
+              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+                tally = 0.0f;
+                for (int i=1; i<nlayers; i++) {
+                  tally += comp.cos_sim[i-1];
+                }
+                comp.cos_sim_total = tally / (nlayers - 1);
+                printf("%s (%.2f): %.3f\n", comp.fname.c_str(), comp.strength, comp.cos_sim_total);
+              /*} else {
+                printf("don't need this shit\n");
+              }*/
+            }
+          }
+        } else {
+
+          cvec.b_tally_mag = 0.0f;
+          cvec.b_tally_prod = 0.0f;
+          for (auto &comp : cvec.components) {
+            comp.b_tally_mag = 0.0f;
+            comp.b_tally_prod = 0.0f;
+            printf("comp[%s]: %.3f\n", comp.fname.c_str(), comp.strength);
+          }
+          printf("initialized the tallies, yo\n");
+
+          int offset = (idx-1)*tsize;
+          for (int i = 0; i < tsize; i++) {
+            mag_state += state[i]*state[i];
+
+            float cv_total = cvec.data[i + offset];
+            cvec.b_tally_mag += cv_total * cv_total;
+            cvec.b_tally_prod += cv_total * state[i];
+            for (auto &comp : cvec.components) {
+              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+                float cv_comp = comp.data[i + offset];
+                comp.b_tally_mag += cv_comp * cv_comp;
+                comp.b_tally_prod += cv_comp * state[i];
+              //}
+            }
+          }
+
+          printf("tallied the tallies, yo\n");
+          printf("b_mag_state: %.3f\n", mag_state);
+          printf("cvec.b_tally_mag: %.3f\n", cvec.b_tally_mag);
+          printf("cvec.b_tally_prod: %.3f\n", cvec.b_tally_prod);
+          for (auto &comp : cvec.components) {
+            if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+              printf("comp[%s].b_tally_mag: %.3f\n", comp.fname.c_str(), comp.b_tally_mag);
+              printf("comp[%s].b_tally_prod: %.3f\n", comp.fname.c_str(), comp.b_tally_prod);
             } else {
-              printf("don't need this shit\n");
+              printf("comp[%s].b_tally_mag: SHIT %.3f\n", comp.fname.c_str(), comp.b_tally_mag);
+              printf("comp[%s].b_tally_prod: SHIT %.3f\n", comp.fname.c_str(), comp.b_tally_prod);
+            }
+          }
+
+          cvec.b_tally_prod /= sqrt(cvec.b_tally_mag * mag_state);
+          if (cvec.b_cos_sim.size() < idx) {
+            cvec.b_cos_sim.push_back(cvec.b_tally_prod);
+          } else {
+            cvec.b_cos_sim[idx-1] = cvec.b_tally_prod;
+          }
+          printf("similarty b_[%s ~ %s] = %.3f\n", t->name, cvec_tensor->name, cvec.b_tally_prod);
+          for (auto &comp : cvec.components) {
+            //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+              comp.b_tally_prod /= sqrt(comp.b_tally_mag * mag_state);
+              if (comp.b_cos_sim.size() < idx) {
+                comp.b_cos_sim.push_back(comp.b_tally_prod);
+              } else {
+                comp.b_cos_sim[idx-1] = comp.b_tally_prod;
+              }
+              printf("similarty b_[%s ~ %s] = %.3f\n", t->name, comp.fname.c_str(), comp.b_tally_prod);
+            /*} else {
+              printf("similarty [%s ~ %s] = SHIT %.3f\n", t->name, comp.fname.c_str(), comp.strength);
+            }*/
+          }
+          if (idx == nlayers - 1) {
+            float tally = 0.0f;
+            for (int i=1; i<nlayers; i++) {
+              tally += cvec.b_cos_sim[i-1];
+            }
+            cvec.b_cos_sim_total = tally / (nlayers - 1);
+            printf("\n====== AVERAGE SIMILARITY ======\n");
+            printf("Total: %.3f\n", cvec.b_cos_sim_total);
+            for (auto &comp : cvec.components) {
+              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
+                tally = 0.0f;
+                for (int i=1; i<nlayers; i++) {
+                  tally += comp.b_cos_sim[i-1];
+                }
+                comp.cos_sim_total = tally / (nlayers - 1);
+                printf("%s b_(%.2f): %.3f\n", comp.fname.c_str(), comp.strength, comp.b_cos_sim_total);
+              /*} else {
+                printf("don't need this shit\n");
+              }*/
             }
           }
         }
-
         // Continue running
         return true;
     }
@@ -3860,7 +3983,7 @@ int main(int argc, char ** argv) {
         if (data.contains("vectors") && data["vectors"].is_array()) {
             for (const auto &item : data["vectors"]) {
               llama_control_vector_load_info v = item.get<llama_control_vector_load_info>();
-              if (v.strength != 0.0f && !std::isnan(v.strength) && !std::isinf(v.strength)) {
+              //if (v.strength != 0.0f && !std::isnan(v.strength) && !std::isinf(v.strength)) {
                 std::string real_fname = "";
                 //std::cout << "Check vec " << v.fname << "\n";
                 // check for path traversal attempt
@@ -3902,7 +4025,7 @@ int main(int argc, char ** argv) {
                 vec_params.push_back(v);
                 real_vec_params.push_back(real_info);
               }
-            }
+            //}
         } else {
             std::cerr << "No vectors array passed\n";
             res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
@@ -3911,7 +4034,7 @@ int main(int argc, char ** argv) {
         }
 
         //const auto cvec = llama_control_vector_load(real_vec_params);
-        cvec = llama_control_vector_load_ensemble(real_vec_params, vec_params);
+        llama_control_vector_load_ensemble(cvec, real_vec_params, vec_params);
 
         if (cvec.n_embd == -1) {
             std::cerr << "Could not load control vector\n";
