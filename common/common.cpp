@@ -3138,7 +3138,8 @@ llama_control_vector_ensemble_data & llama_control_vector_load_ensemble(llama_co
           if (i > 0)
           for (size_t i = 0; i < cur.data.size(); i++) {
             result.data[i] += cur.strength * cur.data[i];
-          } else {
+          } else 
+          for (size_t i = 0; i < cur.data.size(); i++) {
             result.data[i] = cur.strength * cur.data[i];
           }
         //}

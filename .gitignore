@@ -1,3 +1,5 @@
+examples/*.sh
+prompts/*
 *.o
 *.a
 *.so
