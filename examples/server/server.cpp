@@ -3302,17 +3302,6 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                 break;
             }
             sparams.chat_template = argv[i];
-        } else if (arg == "--override-kv") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            if (!parse_kv_override(argv[i], params.kv_overrides)) {
-                fprintf(stderr, "error: Invalid type for KV override: %s\n", argv[i]);
-                invalid_param = true;
-                break;
-            }
-            params.kv_overrides.push_back(kvo);
         } else if (arg == "--control-vector") {
             if (++i >= argc) {
                 invalid_param = true;
