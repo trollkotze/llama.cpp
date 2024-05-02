@@ -607,7 +607,7 @@ int main(int argc, char ** argv) {
 
 
       // Record prompt boundaries
-      const int PROMPT_DELIMITER_TOKEN = 13;
+      const int PROMPT_DELIMITER_TOKEN = 2;
 
       // Index of each delimiter token in `embd_inp`.  These mark the end of each
       // prompt.
@@ -627,8 +627,12 @@ int main(int argc, char ** argv) {
       }
 
       size_t num_prompts = delim_idxs.size();
+      std::cerr << "\n" << num_prompts << "prompts ending at indices:";
+      for (auto idx : delim_idxs) {
+        std::cerr << " " << idx;
+      }
+      std::cerr << "\n\n";
 
-LOG_TEE("NIGGER");
       // Set up eval_state
       gguf_context * eval_gguf = gguf_init_empty();
       {
@@ -667,7 +671,8 @@ LOG_TEE("NIGGER");
       // contain that pair in the old and new states of the KV cache.
       std::unique_ptr<kv_trie_node> old_kv_trie(new kv_trie_node(-1));
       std::unique_ptr<kv_trie_node> new_kv_trie(new kv_trie_node(-1));
-          auto last = ggml_time_ms();
+      auto last = ggml_time_ms();
+
       while (prompt_idx < num_prompts) {
           std::cerr << "start batch at " << prompt_idx << "\n";
           eval_state.first_prompt_idx = prompt_idx;
@@ -694,11 +699,13 @@ LOG_TEE("NIGGER");
           unsigned cur_seq = first_seq;
           unsigned kv_cache_space = n_ctx;
           while (prompt_idx < num_prompts && cur_seq < last_seq) {
-  //            std::cerr << "WHERE IS OUR OOM now? " << prompt_idx << "\n";
+            std::cerr << "prompt_idx:" << prompt_idx << "/" << num_prompts << "\n";
+            std::cerr << "cur_seq/last_seq:" << cur_seq << "/" << last_seq << "\n";
 
-              size_t start = prompt_idx == 0 ? 0 : delim_idxs[prompt_idx - 1] + 1;
-              size_t end = delim_idxs[prompt_idx];
-              GGML_ASSERT(end > start && "empty prompts are not allowed");
+            size_t start = prompt_idx == 0 ? 0 : delim_idxs[prompt_idx - 1] + 1;
+            size_t end = delim_idxs[prompt_idx];
+            std::cerr << "start::end = " << start << "::" << end << "\n";
+            GGML_ASSERT(end > start && "empty prompts are not allowed");
               //std::cerr << "CHECKING BOUNDS\nstart: " << start << "\n" << "end: " << end << "\n" << "kv_cache_space: " << kv_cache_space << "\n";
               /*std::cerr << "adding " << start << " .. " << end
                   << " (" << (end - start) << " tokens); "
@@ -706,38 +713,33 @@ LOG_TEE("NIGGER");
 */
               if (end - start > kv_cache_space) {
 
-                //std::cerr << "biggernitch!\n";
+                  std::cerr << "biggernitch!\n";
                   // Not enough space remaining in the batch, if we hit the worst
                   // case where the prompt consists entirely of new tokens.
                   break;
               }
 
-            //    std::cerr << "gettheniggernodes!\n";
               kv_trie_node * old_node = old_kv_trie.get();
               kv_trie_node * new_node = new_kv_trie.get();
-            //    std::cerr << "g0ttheniggernodes!\n";
 
               for (size_t j = start; j < end; ++j) {
                   int id = embd_inp[j];
                   int pos = j - start;
 
-            //    std::cerr << "lemmetrytofindthatnode!\n";
                   old_node = kv_trie_find(old_node, id);
                   // Regardless of how we handle the token, it will ultimately be
                   // present at position `j` in sequence `cur_seq`.
-            //    std::cerr << "lemmetrytoINSERTthatnode!\n";
                   new_node = kv_trie_insert(new_node, id, cur_seq);
-            //    std::cerr << "node business going on!\n";
                   if (old_node == nullptr) {
+                      std::cerr << "old_node: null\n";
                       // Add a new token.
-            //    std::cerr << "add that token to the batch y0!\n";
                       llama_batch_add(batch, id, pos, {(int)cur_seq}, false);
                       --kv_cache_space;
                       //const std::string token_str = llama_token_to_piece(ctx, id);
                       //LOG_TEE("add '%s' (%d), %d to new sequence %d (fresh)\n",
                       //        token_str.c_str(), id, pos, cur_seq);
                   } else {
-            //    std::cerr << "WE COPY SOME SHIT HERE.\n";
+                      std::cerr << "old_node: { seq: " << old_node->seq << ", retained: " << old_node->retained << ", children: " << old_node->children.size() << " }\n";
                       llama_kv_cache_seq_cp(ctx, old_node->seq, cur_seq, pos, pos + 1);
                       //const std::string token_str = llama_token_to_piece(ctx, id);
                       //LOG_TEE("add '%s' (%d), %d to new sequence %d, from old sequence %d\n",
@@ -752,8 +754,7 @@ LOG_TEE("NIGGER");
                       }
                   }
               }
-
-        //        std::cerr << "Push it back, Jamal.\n";
+              std::cerr << "extract token " << batch.n_tokens-1 << "\n";
               eval_state.extract_tokens.push_back(batch.n_tokens - 1);
 
               ++prompt_idx;
@@ -761,13 +762,11 @@ LOG_TEE("NIGGER");
           }
 
 
-        //  std::cerr << "kv cache business going on.\n";
           for (unsigned seq = 0; seq < batch_max_seq; ++seq) {
               if (seq < first_seq || seq >= last_seq) {
                   llama_kv_cache_seq_rm(ctx, seq, -1, -1);
               }
           }
-        //  std::cerr << "kv cache business went ok.\n";
 
           // Force defragmentation of the KV cache.  `llama_decode` needs a
           // contiguous block of `batch.n_tokens` cache slots, which it won't be
@@ -780,11 +779,8 @@ LOG_TEE("NIGGER");
           // contiguous, then `max_contiguous` should equal the number of free
           // cells (`n_cells - used_cells`), but often this is not the case.
 
-          //std::cerr << "defrag kv cache\n";
           llama_kv_cache_defrag(ctx);
-          //std::cerr << "UPD0000T kv cache\n";
           llama_kv_cache_update(ctx);
-          //std::cerr << "defragGGGED kv cache\n";
 
           for (int i = 0; i < 10; ++i) {
               // Debug prints to check cache usage and fragmentation:
@@ -813,18 +809,15 @@ LOG_TEE("NIGGER");
               << context_used << " total tokens\n";
 
 
-  //        fprintf(stderr, "Let us OOM now.\n");
           if (llama_decode(ctx, batch)) {
               LOG_TEE("%s : failed to eval\n", __func__);
               return 1;
           }
-    //      fprintf(stderr, "We OOMed not.\n");
 
           auto now = ggml_time_ms();
           auto timedelta = now - last;
           last = now;
           std::cerr << "time delta: " << timedelta << "ms\n";
-      //    fprintf(stderr, "We OOMed still not.\n");
           ++batch_idx;
       }
       
