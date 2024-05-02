@@ -658,7 +658,7 @@ int main(int argc, char ** argv) {
 
       printf("Start training from prompts %s ...\n", farg);
       // Record prompt boundaries
-      const int PROMPT_DELIMITER_TOKEN = 13;
+      const int PROMPT_DELIMITER_TOKEN = 2;
 
       // Index of each delimiter token in `embd_inp`.  These mark the end of each
       // prompt.
@@ -822,18 +822,18 @@ int main(int argc, char ** argv) {
           llama_kv_cache_defrag(ctx);
           llama_kv_cache_update(ctx);
 
-          /*
+          
           // Debug prints to check cache usage and fragmentation:
           auto view = llama_kv_cache_view_init(ctx, 1);
           llama_kv_cache_view_update(ctx, &view);
-          //std::cerr << "kv cache cells: " << view.n_cells << "\n";
-          //std::cerr << "kv cache tokens: " << view.token_count << "\n";
-          //std::cerr << "kv cache used: " << view.used_cells << "\n";
+          std::cerr << "kv cache cells: " << view.n_cells << "\n";
+          std::cerr << "kv cache tokens: " << view.token_count << "\n";
+          std::cerr << "kv cache used: " << view.used_cells << "\n";
           std::cerr << "kv cache max_contiguous: " << view.max_contiguous << "\n";
           std::cerr << "kv cache free cells: " << (view.n_cells - view.used_cells) << "\n";
-          */
+          
 
-          //GGML_ASSERT(batch.n_tokens > 0);
+          GGML_ASSERT(batch.n_tokens > 0);
 
 
           std::cerr << "batch " << eval_state.first_prompt_idx << ": "

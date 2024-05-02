@@ -801,7 +801,7 @@ int main(int argc, char ** argv) {
               }
           }
 
-          GGML_ASSERT(batch.n_tokens > 0);
+          //GGML_ASSERT(batch.n_tokens > 0);
 
           std::cerr << "batch " << eval_state.first_prompt_idx << ": "
               << (prompt_idx - eval_state.first_prompt_idx) << " prompts, "
