@@ -386,44 +386,16 @@ int main(int argc, char ** argv) {
           LOG_TEE("%s\n", get_system_info(params).c_str());
       }
 
-      std::string path_session = params.path_prompt_cache;
-      std::vector<llama_token> session_tokens;
-
-      if (!path_session.empty()) {
-          LOG_TEE("%s: attempting to load saved session from '%s'\n", __func__, path_session.c_str());
-          if (!file_exists(path_session)) {
-              LOG_TEE("%s: session file does not exist, will create.\n", __func__);
-          } else if (file_is_empty(path_session)) {
-              LOG_TEE("%s: The session file is empty. A new session will be initialized.\n", __func__);
-          } else {
-              // The file exists and is not empty
-              session_tokens.resize(n_ctx);
-              size_t n_token_count_out = 0;
-              if (!llama_load_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
-                  LOG_TEE("%s: error: failed to load session file '%s'\n", __func__, path_session.c_str());
-                  return 1;
-              }
-              session_tokens.resize(n_token_count_out);
-              llama_set_rng_seed(ctx, params.seed);
-              LOG_TEE("%s: loaded a session with prompt size of %d tokens\n", __func__, (int)session_tokens.size());
-          }
-      }
-
       const bool add_bos = llama_should_add_bos_token(model);
       LOG("add_bos: %d\n", add_bos);
 
       std::vector<llama_token> embd_inp;
 
-      if (params.interactive_first || params.instruct || params.chatml || !params.prompt.empty() || session_tokens.empty()) {
-          LOG("tokenize the prompt\n");
-          if (params.chatml) {
-              params.prompt = "<|im_start|>system\n" + params.prompt + "<|im_end|>";
-          }
-          embd_inp = ::llama_tokenize(ctx, params.prompt, add_bos, true);
-      } else {
-          LOG("use session tokens\n");
-          embd_inp = session_tokens;
+      LOG("tokenize the prompt\n");
+      if (params.chatml) {
+          params.prompt = "<|im_start|>system\n" + params.prompt + "<|im_end|>";
       }
+      embd_inp = ::llama_tokenize(ctx, params.prompt, add_bos, true);
 
       LOG("prompt: \"%s\"\n", log_tostr(params.prompt));
       LOG("tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
@@ -432,42 +404,6 @@ int main(int argc, char ** argv) {
       if (embd_inp.empty()) {
           embd_inp.push_back(llama_token_bos(model));
           LOG("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
-      }
-
-      size_t n_matching_session_tokens = 0;
-      if (!session_tokens.empty()) {
-          for (llama_token id : session_tokens) {
-              if (n_matching_session_tokens >= embd_inp.size() || id != embd_inp[n_matching_session_tokens]) {
-                  break;
-              }
-              n_matching_session_tokens++;
-          }
-          if (params.prompt.empty() && n_matching_session_tokens == embd_inp.size()) {
-              LOG_TEE("%s: using full prompt from session file\n", __func__);
-          } else if (n_matching_session_tokens >= embd_inp.size()) {
-              LOG_TEE("%s: session file has exact match for prompt!\n", __func__);
-          } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
-              LOG_TEE("%s: warning: session file has low similarity to prompt (%zu / %zu tokens); will mostly be reevaluated\n",
-                  __func__, n_matching_session_tokens, embd_inp.size());
-          } else {
-              LOG_TEE("%s: session file matches %zu / %zu tokens of prompt\n",
-                  __func__, n_matching_session_tokens, embd_inp.size());
-          }
-
-          // remove any "future" tokens that we might have inherited from the previous session
-          llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
-      }
-
-      LOGLN(
-              "recalculate the cached logits (check): embd_inp.empty() %s, n_matching_session_tokens %zu, embd_inp.size() %zu, session_tokens.size() %zu, embd_inp.size() %zu",
-              log_tostr(embd_inp.empty()), n_matching_session_tokens, embd_inp.size(), session_tokens.size(), embd_inp.size());
-
-      // if we will use the cache for the full prompt without reaching the end of the cache, force
-      // reevaluation of the last token token to recalculate the cached logits
-      if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() && session_tokens.size() > embd_inp.size()) {
-          LOGLN("recalculate the cached logits (do): session_tokens.resize( %zu )", embd_inp.size() - 1);
-
-          session_tokens.resize(embd_inp.size() - 1);
       }
 
       // number of tokens to keep when resetting context
@@ -622,7 +558,6 @@ int main(int argc, char ** argv) {
       bool is_antiprompt        = false;
       bool input_echo           = true;
       bool display              = true;
-      bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
 
       int n_past             = 0;
       int n_remain           = params.n_predict;
@@ -658,7 +593,7 @@ int main(int argc, char ** argv) {
 
       printf("Start training from prompts %s ...\n", farg);
       // Record prompt boundaries
-      const int PROMPT_DELIMITER_TOKEN = 2;
+      const int PROMPT_DELIMITER_TOKEN = 128000;
 
       // Index of each delimiter token in `embd_inp`.  These mark the end of each
       // prompt.
@@ -819,10 +754,10 @@ int main(int argc, char ** argv) {
           // contiguous, then `max_contiguous` should equal the number of free
           // cells (`n_cells - used_cells`), but often this is not the case.
           std::cerr << "defrag boi\n";
+          auto defragstart = ggml_time_ms();
           llama_kv_cache_defrag(ctx);
           llama_kv_cache_update(ctx);
 
-          
           // Debug prints to check cache usage and fragmentation:
           auto view = llama_kv_cache_view_init(ctx, 1);
           llama_kv_cache_view_update(ctx, &view);
@@ -831,10 +766,25 @@ int main(int argc, char ** argv) {
           std::cerr << "kv cache used: " << view.used_cells << "\n";
           std::cerr << "kv cache max_contiguous: " << view.max_contiguous << "\n";
           std::cerr << "kv cache free cells: " << (view.n_cells - view.used_cells) << "\n";
-          
+          std::cerr << "defrag time: " << (ggml_time_ms() - defragstart)/1000.0 << "\n";
 
-          GGML_ASSERT(batch.n_tokens > 0);
+          GGML_ASSERT(batch.n_tokens > 0 && batch.n_tokens <= view.n_cells - view.used_cells);
 
+          while (view.max_contiguous < batch.n_tokens) {
+            defragstart = ggml_time_ms();
+            std::cerr << "defrag again boi\n";
+            llama_kv_cache_defrag(ctx);
+            llama_kv_cache_update(ctx);
+
+            
+            // Debug prints to check cache usage and fragmentation:
+            llama_kv_cache_view_update(ctx, &view);
+            std::cerr << "kv cache cells: " << view.n_cells << "\n";
+            std::cerr << "kv cache tokens: " << view.token_count << "\n";
+            std::cerr << "kv cache used: " << view.used_cells << "\n";
+            std::cerr << "kv cache max_contiguous: " << view.max_contiguous << "\n";
+            std::cerr << "kv cache free cells: " << (view.n_cells - view.used_cells) << "\n";
+          }
 
           std::cerr << "batch " << eval_state.first_prompt_idx << ": "
               << (prompt_idx - eval_state.first_prompt_idx) << " prompts, "
@@ -873,11 +823,6 @@ int main(int argc, char ** argv) {
       }
 
       gguf_write_to_file(eval_gguf, fname, false);
-
-      if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
-          LOG_TEE("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
-          llama_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
-      }
 
       llama_print_timings(ctx);
       //write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
