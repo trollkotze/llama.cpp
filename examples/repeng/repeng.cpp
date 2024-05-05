@@ -607,7 +607,7 @@ int main(int argc, char ** argv) {
 
 
       // Record prompt boundaries
-      const int PROMPT_DELIMITER_TOKEN = 2;
+      const int PROMPT_DELIMITER_TOKEN = 128000;
 
       // Index of each delimiter token in `embd_inp`.  These mark the end of each
       // prompt.

@@ -468,7 +468,8 @@ int main(int argc, char ** argv) {
       std::vector<size_t> delim_idxs;
 
       for (size_t i = 0; i < embd_inp.size(); ++i) {
-          if (embd_inp[i] == PROMPT_DELIMITER_TOKEN) {
+          // If the first prompt starts with an ending delimiter, ignor it.
+          if (i != 0 && embd_inp[i] == PROMPT_DELIMITER_TOKEN) {
               delim_idxs.push_back(i);
           }
       }
