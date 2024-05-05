@@ -1,7 +1,6 @@
 #include "utils.hpp"
 
 #include "common.h"
-#include "json-schema-to-grammar.h"
 #include "llama.h"
 #include "grammar-parser.h"
 
@@ -29,10 +28,9 @@
 #include <thread>
 #include <signal.h>
 #include <memory>
-#include <dirent.h>
 
-using json = nlohmann::ordered_json;
-llama_control_vector_ensemble_data cvec = { -1, {} };
+using json = nlohmann::json;
+
 bool server_verbose = false;
 bool server_log_json = true;
 
@@ -62,10 +60,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
-    SERVER_TASK_TYPE_METRICS,
-    SERVER_TASK_TYPE_SLOT_SAVE,
-    SERVER_TASK_TYPE_SLOT_RESTORE,
-    SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_METRICS
 };
 
 struct server_task {
@@ -103,7 +98,6 @@ struct slot_params {
 
     uint32_t seed      = -1; // RNG seed
     int32_t  n_keep    =  0; // number of tokens to keep from initial prompt
-    int32_t  n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t  n_predict = -1; // new tokens to predict
 
     std::vector<std::string> antiprompt;
@@ -125,8 +119,6 @@ struct server_params {
 
     std::vector<std::string> api_keys;
 
-    std::vector<llama_control_vector_load_option> control_vector_load_options;
-
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     std::string ssl_key_file = "";
     std::string ssl_cert_file = "";
@@ -134,429 +126,7 @@ struct server_params {
 
     bool slots_endpoint   = true;
     bool metrics_endpoint = false;
-    std::string slot_save_path;
 };
-
-struct llama_control_vector {
-    std::vector<struct ggml_tensor *> tensors; // per layer
-    std::vector<struct ggml_context *> ctxs;
-    std::vector<ggml_backend_buffer_t> bufs;
-
-    int32_t layer_start = -1;
-    int32_t layer_end   = -1;
-
-    ggml_tensor * tensor_for(int il) const {
-        if (il < 0 || il < layer_start || il > layer_end || (size_t) il >= tensors.size()) {
-            return nullptr;
-        }
-        return tensors[il];
-    }
-
-    ~llama_control_vector() {
-        for (struct ggml_context * ctx : ctxs) {
-            ggml_free(ctx);
-        }
-        for (ggml_backend_buffer_t buf : bufs) {
-            ggml_backend_buffer_free(buf);
-        }
-    }
-};
-static std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_params_with_cb_eval(
-    gpt_params & params,
-    ggml_backend_sched_eval_callback cb_eval,
-    void * cb_eval_user_data) {
-    auto mparams = llama_model_params_from_gpt_params(params);
-
-    llama_model * model  = llama_load_model_from_file(params.model.c_str(), mparams);
-    if (model == NULL) {
-        fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
-        return std::make_tuple(nullptr, nullptr);
-    }
-
-    auto cparams = llama_context_params_from_gpt_params(params);
-
-    cparams.cb_eval = cb_eval;
-    cparams.cb_eval_user_data = cb_eval_user_data;
-
-    llama_context * lctx = llama_new_context_with_model(model, cparams);
-    if (lctx == NULL) {
-        fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, params.model.c_str());
-        llama_free_model(model);
-        return std::make_tuple(nullptr, nullptr);
-    }
-
-    if (!params.control_vectors.empty()) {
-        if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
-        if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_n_layer(model);
-
-        const auto cvec = llama_control_vector_load(params.control_vectors);
-        if (cvec.n_embd == -1) {
-            llama_free(lctx);
-            llama_free_model(model);
-            return std::make_tuple(nullptr, nullptr);
-        }
-
-        int err = llama_control_vector_apply(lctx,
-                                             cvec.data.data(),
-                                             cvec.data.size(),
-                                             cvec.n_embd,
-                                             params.control_vector_layer_start,
-                                             params.control_vector_layer_end);
-        if (err) {
-            llama_free(lctx);
-            llama_free_model(model);
-            return std::make_tuple(nullptr, nullptr);
-        }
-    }
-
-    for (unsigned int i = 0; i < params.lora_adapter.size(); ++i) {
-        const std::string& lora_adapter = std::get<0>(params.lora_adapter[i]);
-        float lora_scale = std::get<1>(params.lora_adapter[i]);
-        int err = llama_model_apply_lora_from_file(model,
-                                             lora_adapter.c_str(),
-                                             lora_scale,
-                                             ((i > 0) || params.lora_base.empty())
-                                                ? NULL
-                                                : params.lora_base.c_str(),
-                                             params.n_threads);
-        if (err != 0) {
-            fprintf(stderr, "%s: error: failed to apply lora adapter\n", __func__);
-            llama_free(lctx);
-            llama_free_model(model);
-            return std::make_tuple(nullptr, nullptr);
-        }
-    }
-
-    if (params.ignore_eos) {
-        params.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
-    }
-
-    {
-        LOG("warming up the model with an empty run\n");
-
-        std::vector<llama_token> tmp = { llama_token_bos(model), llama_token_eos(model), };
-        llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch), 0, 0));
-        llama_kv_cache_clear(lctx);
-        llama_synchronize(lctx);
-        llama_reset_timings(lctx);
-    }
-
-    return std::make_tuple(model, lctx);
-}
-
-struct eval_callback_state {
-    llama_control_vector *cvec;
-    llama_context *ctx;
-    bool wrong = false;
-    bool bwrong = false;
-    float state[8192];
-    float bstate[8192];
-};
-static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
-  //ffn_out
-    struct eval_callback_state * eval_state = (eval_callback_state *)user_data;
-    bool is_l_out = strncmp(t->name, "l_out-", 6) == 0 && t->name[6] != '0';
-    bool is_ffn_out = strncmp(t->name, "ffn_out-", 6) == 0 && t->name[6] != '0';
-    if (ask) {
-        // Report whether we want to observe this tensor.
-        if (is_l_out || is_ffn_out) {
-            printf("Want to observe %s yo\n", t->name);
-            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-              printf("%d ", t->ne[i]);
-            }
-            printf("\n");
-            return true;
-        } else {
-            printf("Don't care about this shit: %s ", t->name);
-            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-              printf("%d ", t->ne[i]);
-            }
-            printf("\n");
-            return false;
-        }
-    } else {
-        // Actually observe the tensor data.
-        printf("Do observe %s yo dimensions:", t->name);
-        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-          printf(" %d", t->ne[i]);
-        }
-        printf("\n");
-        int idx = atoi(&t->name[6]);
-        if (idx == 1) {
-          if (is_l_out)
-            eval_state->wrong = false;
-          else
-            eval_state->bwrong = false;
-        }
-        if (is_l_out && eval_state->wrong || !is_l_out && eval_state->bwrong) {
-          printf("We were wrong.\n");
-          return true;
-        }
-        if (eval_state == nullptr) {
-          printf("eval_state ptr is null\n");
-          if (is_l_out)
-            eval_state->wrong = true;
-          else
-            eval_state->bwrong = true;
-          return true;
-        }
-        if (eval_state->cvec == nullptr) {
-          if (is_l_out)
-            eval_state->wrong = true;
-          else
-            eval_state->bwrong = true;
-          eval_state->wrong = true;
-          return true;
-        }
-        if (
-          eval_state->cvec->layer_start <= -1 ||
-          eval_state->cvec->layer_end <= -1 ||
-          eval_state->cvec->layer_start >= eval_state->cvec->layer_end
-        ) {
-          printf("vec layer range not mkay %d %d\n", eval_state->cvec->layer_start, eval_state->cvec->layer_end);
-          if (is_l_out)
-            eval_state->wrong = true;
-          else
-            eval_state->bwrong = true;
-          return true;
-        }
-        size_t nlayers = eval_state->cvec->tensors.size();
-        size_t tsize = t->ne[0];
-        if (nlayers <= idx) {
-          printf("the universe has collapsed, bro: %d < %d\n", nlayers, idx);
-          if (is_l_out)
-            eval_state->wrong = true;
-          else
-            eval_state->bwrong = true;
-          return true;
-        }
-        bool wrong = false;
-        if (is_l_out)
-          eval_state->wrong = false;
-        else
-          eval_state->bwrong = false;
-        bool toomany = false;
-        auto cvec_tensor = eval_state->cvec->tensors[idx];
-        printf("cvec %s dimensions:", cvec_tensor->name);
-        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-          printf(" %d", cvec_tensor->ne[i]);
-          if (cvec_tensor->ne[i] != t->ne[i])
-            if (is_l_out)
-              eval_state->wrong = true;
-            else
-              eval_state->bwrong = true;
-          if (i > 0 && cvec_tensor->ne[i] > 1)
-            toomany = true;
-        }
-        printf("\n");
-        if (wrong) {
-          printf("wrong dimensions\n");
-          if (is_l_out)
-            eval_state->wrong = true;
-          else
-            eval_state->bwrong = true;
-          return true;
-        }
-        if (toomany) {
-          printf("too many dimensions\n");
-          if (is_l_out)
-            eval_state->wrong = true;
-          else
-            eval_state->bwrong = true;
-          return true;
-        }
-        int s1 = ggml_element_size(t);
-        int s2 = ggml_element_size(cvec_tensor);
-        enum ggml_type t1 = t->type;
-        enum ggml_type t2 = cvec_tensor->type;
-        int n1 = ggml_nbytes(t);
-        int n2 = ggml_nbytes(cvec_tensor);
-        if (t1 != t2 || s1 != s2 || n1 != n2) {
-          printf("something fishy here, bro\n");
-          printf("tensor size %d =?= %d: %s\n", s1, s2, s1 == s2 ? "yes" : "no");
-          printf("tensor type %d =?= %d: %s\n", t1, t2, t1 == t2 ? "yes" : "no");
-          printf("tensor nbytes %d =?= %d: %s\n", n1, n2, n1 == n2 ? "yes" : "no");
-          if (is_l_out)
-            eval_state->wrong = true;
-          else
-            eval_state->bwrong = true;
-          return true;
-        }
-        //printf("dimension check: %d %d\n", s1, t->ne[0]);
-        //GGML_ASSERT((s1 == 4 && t->ne[0] == 8192 && eval_state->cvec->tensors.size() == 80));
-        printf("get the fucking tensor\n");
-        float *state = is_l_out ? eval_state->state : eval_state->bstate;
-        ggml_backend_tensor_get(t, state, 0, s1 * tsize);
-        printf("got the fucking tensor\n");
-        float mag_state = 0.0f;
-        if (is_l_out) {
-          cvec.tally_mag = 0.0f;
-          cvec.tally_prod = 0.0f;
-          for (auto &comp : cvec.components) {
-            comp.tally_mag = 0.0f;
-            comp.tally_prod = 0.0f;
-            printf("comp[%s]: %.3f\n", comp.fname.c_str(), comp.strength);
-          }
-          printf("initialized the tallies, yo\n");
-
-          int offset = (idx-1)*tsize;
-          for (int i = 0; i < tsize; i++) {
-            mag_state += state[i]*state[i];
-
-            float cv_total = cvec.data[i + offset];
-            cvec.tally_mag += cv_total * cv_total;
-            cvec.tally_prod += cv_total * state[i];
-            for (auto &comp : cvec.components) {
-              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-                float cv_comp = comp.data[i + offset];
-                comp.tally_mag += cv_comp * cv_comp;
-                comp.tally_prod += cv_comp * state[i];
-              //}
-            }
-          }
-
-          printf("tallied the tallies, yo\n");
-          printf("mag_state: %.3f\n", mag_state);
-          printf("cvec.tally_mag: %.3f\n", cvec.tally_mag);
-          printf("cvec.tally_prod: %.3f\n", cvec.tally_prod);
-          for (auto &comp : cvec.components) {
-            if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-              printf("comp[%s].tally_mag: %.3f\n", comp.fname.c_str(), comp.tally_mag);
-              printf("comp[%s].tally_prod: %.3f\n", comp.fname.c_str(), comp.tally_prod);
-            } else {
-              printf("comp[%s].tally_mag: SHIT %.3f\n", comp.fname.c_str(), comp.tally_mag);
-              printf("comp[%s].tally_prod: SHIT %.3f\n", comp.fname.c_str(), comp.tally_prod);
-            }
-          }
-
-          cvec.tally_prod /= sqrt(cvec.tally_mag * mag_state);
-          if (cvec.cos_sim.size() < idx) {
-            cvec.cos_sim.push_back(cvec.tally_prod);
-          } else {
-            cvec.cos_sim[idx-1] = cvec.tally_prod;
-          }
-          printf("similarty [%s ~ %s] = %.3f\n", t->name, cvec_tensor->name, cvec.tally_prod);
-          for (auto &comp : cvec.components) {
-            //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-              comp.tally_prod /= sqrt(comp.tally_mag * mag_state);
-              if (comp.cos_sim.size() < idx) {
-                comp.cos_sim.push_back(comp.tally_prod);
-              } else {
-                comp.cos_sim[idx-1] = comp.tally_prod;
-              }
-              printf("similarty [%s ~ %s] = %.3f\n", t->name, comp.fname.c_str(), comp.tally_prod);
-            /*} else {
-              printf("similarty [%s ~ %s] = SHIT %.3f\n", t->name, comp.fname.c_str(), comp.strength);
-            }*/
-          }
-          if (idx == nlayers - 1) {
-            float tally = 0.0f;
-            for (int i=1; i<nlayers; i++) {
-              tally += cvec.cos_sim[i-1];
-            }
-            cvec.cos_sim_total = tally / (nlayers - 1);
-            printf("\n====== AVERAGE SIMILARITY ======\n");
-            printf("Total: %.3f\n", cvec.cos_sim_total);
-            for (auto &comp : cvec.components) {
-              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-                tally = 0.0f;
-                for (int i=1; i<nlayers; i++) {
-                  tally += comp.cos_sim[i-1];
-                }
-                comp.cos_sim_total = tally / (nlayers - 1);
-                printf("%s (%.2f): %.3f\n", comp.fname.c_str(), comp.strength, comp.cos_sim_total);
-              /*} else {
-                printf("don't need this shit\n");
-              }*/
-            }
-          }
-        } else {
-
-          cvec.b_tally_mag = 0.0f;
-          cvec.b_tally_prod = 0.0f;
-          for (auto &comp : cvec.components) {
-            comp.b_tally_mag = 0.0f;
-            comp.b_tally_prod = 0.0f;
-            printf("comp[%s]: %.3f\n", comp.fname.c_str(), comp.strength);
-          }
-          printf("initialized the tallies, yo\n");
-
-          int offset = (idx-1)*tsize;
-          for (int i = 0; i < tsize; i++) {
-            mag_state += state[i]*state[i];
-
-            float cv_total = cvec.data[i + offset];
-            cvec.b_tally_mag += cv_total * cv_total;
-            cvec.b_tally_prod += cv_total * state[i];
-            for (auto &comp : cvec.components) {
-              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-                float cv_comp = comp.data[i + offset];
-                comp.b_tally_mag += cv_comp * cv_comp;
-                comp.b_tally_prod += cv_comp * state[i];
-              //}
-            }
-          }
-
-          printf("tallied the tallies, yo\n");
-          printf("b_mag_state: %.3f\n", mag_state);
-          printf("cvec.b_tally_mag: %.3f\n", cvec.b_tally_mag);
-          printf("cvec.b_tally_prod: %.3f\n", cvec.b_tally_prod);
-          for (auto &comp : cvec.components) {
-            if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-              printf("comp[%s].b_tally_mag: %.3f\n", comp.fname.c_str(), comp.b_tally_mag);
-              printf("comp[%s].b_tally_prod: %.3f\n", comp.fname.c_str(), comp.b_tally_prod);
-            } else {
-              printf("comp[%s].b_tally_mag: SHIT %.3f\n", comp.fname.c_str(), comp.b_tally_mag);
-              printf("comp[%s].b_tally_prod: SHIT %.3f\n", comp.fname.c_str(), comp.b_tally_prod);
-            }
-          }
-
-          cvec.b_tally_prod /= sqrt(cvec.b_tally_mag * mag_state);
-          if (cvec.b_cos_sim.size() < idx) {
-            cvec.b_cos_sim.push_back(cvec.b_tally_prod);
-          } else {
-            cvec.b_cos_sim[idx-1] = cvec.b_tally_prod;
-          }
-          printf("similarty b_[%s ~ %s] = %.3f\n", t->name, cvec_tensor->name, cvec.b_tally_prod);
-          for (auto &comp : cvec.components) {
-            //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-              comp.b_tally_prod /= sqrt(comp.b_tally_mag * mag_state);
-              if (comp.b_cos_sim.size() < idx) {
-                comp.b_cos_sim.push_back(comp.b_tally_prod);
-              } else {
-                comp.b_cos_sim[idx-1] = comp.b_tally_prod;
-              }
-              printf("similarty b_[%s ~ %s] = %.3f\n", t->name, comp.fname.c_str(), comp.b_tally_prod);
-            /*} else {
-              printf("similarty [%s ~ %s] = SHIT %.3f\n", t->name, comp.fname.c_str(), comp.strength);
-            }*/
-          }
-          if (idx == nlayers - 1) {
-            float tally = 0.0f;
-            for (int i=1; i<nlayers; i++) {
-              tally += cvec.b_cos_sim[i-1];
-            }
-            cvec.b_cos_sim_total = tally / (nlayers - 1);
-            printf("\n====== AVERAGE SIMILARITY ======\n");
-            printf("Total: %.3f\n", cvec.b_cos_sim_total);
-            for (auto &comp : cvec.components) {
-              //if (comp.strength != 0.0f && !std::isnan(comp.strength) && !std::isinf(comp.strength)) {
-                tally = 0.0f;
-                for (int i=1; i<nlayers; i++) {
-                  tally += comp.b_cos_sim[i-1];
-                }
-                comp.cos_sim_total = tally / (nlayers - 1);
-                printf("%s b_(%.2f): %.3f\n", comp.fname.c_str(), comp.strength, comp.b_cos_sim_total);
-              /*} else {
-                printf("don't need this shit\n");
-              }*/
-            }
-          }
-        }
-        // Continue running
-        return true;
-    }
-}
 
 struct server_slot {
     int id;
@@ -608,7 +178,6 @@ struct server_slot {
     llama_token sampled;
     struct llama_sampling_params sparams;
     llama_sampling_context * ctx_sampling = nullptr;
-    json json_schema;
 
     int32_t ga_i = 0;   // group-attention state
     int32_t ga_n = 1;   // group-attention factor
@@ -1097,59 +666,22 @@ struct server_context {
         }
     }
 
-    ggml_context * eval_ctx = nullptr;
-    struct eval_callback_state eval_state;
-
     bool load_model(const gpt_params & params_) {
-
-        eval_state.cvec = nullptr;
         params = params_;
 
         // dedicate one sequence to the system prompt
         params.n_parallel += 1;
 
-
-        // std::tie(model, ctx) = llama_init_from_gpt_params(params);
-        printf("Tie this shit\n");
-        std::tie(model, ctx) = llama_init_from_gpt_params_with_cb_eval(
-            params,
-            eval_callback,
-            (void *)&eval_state
-        );
+        std::tie(model, ctx) = llama_init_from_gpt_params(params);
         params.n_parallel -= 1; // but be sneaky about it
         if (model == nullptr) {
             LOG_ERROR("unable to load model", {{"model", params.model}});
             return false;
         }
-        eval_state.ctx = ctx;
-        eval_state.cvec = get_llama_control_vector(ctx);
-
-        /** Set up eval_state
-        gguf_context * eval_gguf = gguf_init_empty();
-        {
-            int n_embd = llama_n_embd(model);
-            int n_layer = llama_n_layer(model);
-            std::cerr << "build eval state: " //<< num_prompts << " prompts, "
-                << n_embd << " embd, " << n_layer << " layers\n";
-
-            struct ggml_init_params params = {};
-            params.mem_size = ((size_t)n_embd * sizeof(float) + 1024) * n_layer; // num_prompts *
-            eval_ctx = ggml_init(params);
-
-            for (int i = 0; i < n_layer; ++i) {
-                ggml_tensor * t = ggml_new_tensor_1d(eval_ctx, GGML_TYPE_F32, n_embd); //2d , num_prompts
-                snprintf(t->name, sizeof(t->name), "l_out-%d", i);
-                eval_state.tensors.push_back(t);
-                gguf_add_tensor(eval_gguf, t);
-            }
-            eval_state.first_prompt_idx = -1;
-            printf("Got llama control vector address %p\n", eval_state.cvec);
-        }*/
 
         n_ctx = llama_n_ctx(ctx);
 
         add_bos_token = llama_should_add_bos_token(model);
-        GGML_ASSERT(llama_add_eos_token(model) != 1);
 
         return true;
     }
@@ -1212,14 +744,13 @@ struct server_context {
         {
             const int32_t n_batch = llama_n_batch(ctx);
 
-            // only a single seq_id per token is needed
-            batch = llama_batch_init(n_batch, 0, 1);
+            batch = llama_batch_init(n_batch, 0, params.n_parallel);
         }
 
         metrics.init();
     }
 
-    std::vector<llama_token> tokenize(const json & json_prompt, bool add_special) const {
+    std::vector<llama_token> tokenize(const json & json_prompt, bool add_bos) const {
         // TODO: currently, we tokenize using special tokens by default
         //       this is not always correct (see https://github.com/ggerganov/llama.cpp/pull/4160#issuecomment-1824826216)
         //       but it's better compared to completely ignoring ChatML and other chat templates
@@ -1237,7 +768,7 @@ struct server_context {
 
                     std::vector<llama_token> p;
                     if (first) {
-                        p = ::llama_tokenize(ctx, s, add_special, TMP_FORCE_SPECIAL);
+                        p = ::llama_tokenize(ctx, s, add_bos, TMP_FORCE_SPECIAL);
                         first = false;
                     } else {
                         p = ::llama_tokenize(ctx, s, false, TMP_FORCE_SPECIAL);
@@ -1254,7 +785,7 @@ struct server_context {
             }
         } else {
             auto s = json_prompt.template get<std::string>();
-            prompt_tokens = ::llama_tokenize(ctx, s, add_special, TMP_FORCE_SPECIAL);
+            prompt_tokens = ::llama_tokenize(ctx, s, add_bos, TMP_FORCE_SPECIAL);
         }
 
         return prompt_tokens;
@@ -1302,7 +833,6 @@ struct server_context {
         slot.sparams.tfs_z             = json_value(data, "tfs_z",             default_sparams.tfs_z);
         slot.sparams.typical_p         = json_value(data, "typical_p",         default_sparams.typical_p);
         slot.sparams.temp              = json_value(data, "temperature",       default_sparams.temp);
-        slot.sparams.smoothing_factor  = json_value(data, "smoothing_factor",  default_sparams.smoothing_factor);
         slot.sparams.dynatemp_range    = json_value(data, "dynatemp_range",    default_sparams.dynatemp_range);
         slot.sparams.dynatemp_exponent = json_value(data, "dynatemp_exponent", default_sparams.dynatemp_exponent);
         slot.sparams.penalty_last_n    = json_value(data, "repeat_last_n",     default_sparams.penalty_last_n);
@@ -1314,26 +844,10 @@ struct server_context {
         slot.sparams.mirostat_eta      = json_value(data, "mirostat_eta",      default_sparams.mirostat_eta);
         slot.sparams.penalize_nl       = json_value(data, "penalize_nl",       default_sparams.penalize_nl);
         slot.params.n_keep             = json_value(data, "n_keep",            slot.params.n_keep);
-        slot.params.n_discard          = json_value(data, "n_discard",         default_params.n_discard);
-        slot.sparams.seed              = json_value(data, "seed",              default_sparams.seed);
+        slot.params.seed               = json_value(data, "seed",              default_params.seed);
+        slot.sparams.grammar           = json_value(data, "grammar",           default_sparams.grammar);
         slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
         slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
-
-        // process "json_schema" and "grammar"
-        if (data.contains("json_schema") && !data["json_schema"].is_null() && data.contains("grammar") && !data["grammar"].is_null()) {
-            send_error(task, "Either \"json_schema\" or \"grammar\" can be specified, but not both", ERROR_TYPE_INVALID_REQUEST);
-            return false;
-        } else if (data.contains("json_schema") && !data.contains("grammar")) {
-            try {
-                auto schema                = json_value(data, "json_schema", json::object());
-                slot.sparams.grammar       = json_schema_to_grammar(schema);
-            } catch (const std::exception & e) {
-                send_error(task, std::string("\"json_schema\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-        } else {
-            slot.sparams.grammar       = json_value(data, "grammar",           default_sparams.grammar);
-        }
 
         if (slot.params.cache_prompt && slot.ga_n != 1) {
             LOG_WARNING("cache_prompt is not supported with group-attention", {});
@@ -1489,6 +1003,7 @@ struct server_context {
                 send_error(task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
+            llama_set_rng_seed(ctx, slot.params.seed);
         }
 
         slot.command = SLOT_COMMAND_LOAD_PROMPT;
@@ -1519,7 +1034,7 @@ struct server_context {
         system_tokens.clear();
 
         if (!system_prompt.empty()) {
-            system_tokens = ::llama_tokenize(ctx, system_prompt, true);
+            system_tokens = ::llama_tokenize(ctx, system_prompt, add_bos_token);
 
             llama_batch_clear(batch);
 
@@ -1543,7 +1058,7 @@ struct server_context {
                 };
 
                 if (llama_decode(ctx, batch_view) != 0) {
-                    LOG_ERROR("llama_decode() failed", {});
+                    LOG_TEE("%s: llama_decode() failed\n", __func__);
                     return;
                 }
             }
@@ -1578,7 +1093,7 @@ struct server_context {
 
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
-        const std::string token_str = llama_token_to_piece(ctx, result.tok, false);
+        const std::string token_str = llama_token_to_piece(ctx, result.tok);
         slot.sampled = result.tok;
 
         // search stop word and delete it
@@ -1661,32 +1176,11 @@ struct server_context {
             });
         }
 
-        if (llama_token_is_eog(model, result.tok)) {
+        if (result.tok == llama_token_eos(model)) {
             slot.stopped_eos    = true;
             slot.has_next_token = false;
 
             LOG_VERBOSE("eos token found", {});
-        }
-
-        auto n_ctx_train = llama_n_ctx_train(model);
-        if (slot.params.n_predict < 1 && slot.n_predict < 1 && slot.ga_n == 1
-                    && slot.n_prompt_tokens + slot.n_decoded >= n_ctx_train) {
-            LOG_WARNING("n_predict is not set and self-context extend is disabled."
-                        " Limiting generated tokens to n_ctx_train to avoid EOS-less generation infinite loop", {
-                    { "id_slot",              slot.id },
-                    { "params.n_predict",     slot.params.n_predict },
-                    { "slot.n_prompt_tokens", slot.n_prompt_tokens },
-                    { "slot.n_decoded",       slot.n_decoded },
-                    { "slot.n_predict",       slot.n_predict },
-                    { "n_slots",              params.n_parallel },
-                    { "slot.n_ctx",           slot.n_ctx },
-                    { "n_ctx",                n_ctx },
-                    { "n_ctx_train",          n_ctx_train },
-                    { "ga_n",                 slot.ga_n },
-                });
-            slot.truncated      = true;
-            slot.stopped_limit  = true;
-            slot.has_next_token = false; // stop prediction
         }
 
         LOG_VERBOSE("next token", {
@@ -1722,7 +1216,6 @@ struct server_context {
             {"model",                     params.model_alias},
             {"seed",                      slot.params.seed},
             {"temperature",               slot.sparams.temp},
-            {"smoothing_factor",          slot.sparams.smoothing_factor},
             {"dynatemp_range",            slot.sparams.dynatemp_range},
             {"dynatemp_exponent",         slot.sparams.dynatemp_exponent},
             {"top_k",                     slot.sparams.top_k},
@@ -1742,8 +1235,7 @@ struct server_context {
             {"penalize_nl",               slot.sparams.penalize_nl},
             {"stop",                      slot.params.antiprompt},
             {"n_predict",                 slot.params.n_predict}, // TODO: fix duplicate key n_predict
-            {"n_keep",                    slot.params.n_keep},
-            {"n_discard",                 slot.params.n_discard},
+            {"n_keep",                    params.n_keep},
             {"ignore_eos",                ignore_eos},
             {"stream",                    slot.params.stream},
             {"logit_bias",                slot.sparams.logit_bias},
@@ -1763,11 +1255,7 @@ struct server_context {
     }
 
     void send_error(const int id_task, const int id_multi, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
-        LOG_ERROR("task error", {
-            {"id_multi", id_multi},
-            {"id_task", id_task},
-            {"error", error},
-        });
+        LOG_TEE("task %i - error: %s\n", id_task, error.c_str());
 
         server_task_result res;
         res.id       = id_task;
@@ -1808,14 +1296,6 @@ struct server_context {
             res.data["completion_probabilities"] = probs_vector_to_json(ctx, probs_output);
         }
 
-        std::vector<cos_sim_component> cscs;
-        for (auto &comp : cvec.components) {
-          cos_sim_component csc({ fname: comp.fname, value: comp.cos_sim_total });
-          cscs.push_back(csc);
-        }
-        res.data["cos_sim_total"] = cvec.cos_sim_total;
-        res.data["cos_sim_components"] = cos_sim_components_to_json(cscs);
-
         if (slot.oaicompat) {
             res.data["oaicompat_token_ctr"] = slot.n_decoded;
             res.data["model"] = slot.oaicompat_model;
@@ -1853,10 +1333,9 @@ struct server_context {
             if (!slot.params.stream && slot.stopped_word) {
                 const std::vector<llama_token> stop_word_toks = llama_tokenize(ctx, slot.stopping_word, false);
 
-                size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());
                 probs = std::vector<completion_token_output>(
                         slot.generated_token_probs.begin(),
-                        slot.generated_token_probs.end() - safe_offset);
+                        slot.generated_token_probs.end() - stop_word_toks.size());
             } else {
                 probs = std::vector<completion_token_output>(
                         slot.generated_token_probs.begin(),
@@ -1865,13 +1344,6 @@ struct server_context {
 
             res.data["completion_probabilities"] = probs_vector_to_json(ctx, probs);
         }
-        std::vector<cos_sim_component> cscs;
-        for (auto &comp : cvec.components) {
-          cos_sim_component csc({ fname: comp.fname, value: comp.cos_sim_total });
-          cscs.push_back(csc);
-        }
-        res.data["cos_sim_total"] = cvec.cos_sim_total;
-        res.data["cos_sim_components"] = cos_sim_components_to_json(cscs);
 
         if (slot.oaicompat) {
             res.data["oaicompat_token_ctr"] = slot.n_decoded;
@@ -2119,107 +1591,6 @@ struct server_context {
                     }
                     queue_results.send(res);
                 } break;
-            case SERVER_TASK_TYPE_SLOT_SAVE:
-                {
-                    int id_slot = task.data["id_slot"];
-                    server_slot * slot = get_slot(id_slot);
-                    if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-
-                    const size_t token_count = slot->cache_tokens.size();
-                    const int64_t t_start = ggml_time_us();
-
-                    std::string filename = task.data["filename"];
-                    std::string filepath = task.data["filepath"];
-
-                    const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id + 1, slot->cache_tokens.data(), token_count);
-
-                    const int64_t t_end = ggml_time_us();
-                    const double t_save_ms = (t_end - t_start) / 1000.0;
-
-                    server_task_result result;
-                    result.id = task.id;
-                    result.stop = true;
-                    result.error = false;
-                    result.data = json {
-                        { "id_slot",   id_slot },
-                        { "filename",  filename },
-                        { "n_saved",   token_count }, // tokens saved
-                        { "n_written", nwrite },      // bytes written
-                        { "timings", {
-                            { "save_ms", t_save_ms }
-                        } }
-                    };
-                    queue_results.send(result);
-                } break;
-            case SERVER_TASK_TYPE_SLOT_RESTORE:
-                {
-                    int id_slot = task.data["id_slot"];
-                    server_slot * slot = get_slot(id_slot);
-                    if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-
-                    const int64_t t_start = ggml_time_us();
-
-                    std::string filename = task.data["filename"];
-                    std::string filepath = task.data["filepath"];
-
-                    slot->cache_tokens.resize(slot->n_ctx);
-                    size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id + 1, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
-                    if (nread == 0) {
-                        slot->cache_tokens.resize(0);
-                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    slot->cache_tokens.resize(token_count);
-
-                    const int64_t t_end = ggml_time_us();
-                    const double t_restore_ms = (t_end - t_start) / 1000.0;
-
-                    server_task_result result;
-                    result.id = task.id;
-                    result.stop = true;
-                    result.error = false;
-                    result.data = json {
-                        { "id_slot",    id_slot },
-                        { "filename",   filename },
-                        { "n_restored", token_count }, // tokens restored
-                        { "n_read",     nread },       // bytes read
-                        { "timings", {
-                            { "restore_ms", t_restore_ms }
-                        } }
-                    };
-                    queue_results.send(result);
-                } break;
-            case SERVER_TASK_TYPE_SLOT_ERASE:
-                {
-                    int id_slot = task.data["id_slot"];
-                    server_slot * slot = get_slot(id_slot);
-                    if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-
-                    // Erase token cache
-                    const size_t n_erased = slot->cache_tokens.size();
-                    llama_kv_cache_seq_rm(ctx, slot->id + 1, -1, -1);
-                    slot->cache_tokens.clear();
-
-                    server_task_result result;
-                    result.id = task.id;
-                    result.stop = true;
-                    result.error = false;
-                    result.data = json {
-                        { "id_slot",  id_slot },
-                        { "n_erased", n_erased }
-                    };
-                    queue_results.send(result);
-                } break;
         }
     }
 
@@ -2308,7 +1679,7 @@ struct server_context {
                     // Shift context
                     const int n_keep    = slot.params.n_keep + add_bos_token;
                     const int n_left    = (int) system_tokens.size() + slot.n_past - n_keep;
-                    const int n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
+                    const int n_discard = n_left / 2;
 
                     LOG_INFO("slot context shift", {
                         {"id_slot",         slot.id},
@@ -2375,7 +1746,7 @@ struct server_context {
         }
 
         // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx);
+        int32_t n_batch = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
         // next, batch any pending prompts without exceeding n_batch
@@ -2417,7 +1788,7 @@ struct server_context {
                             prefix_tokens.push_back(llama_token_middle(model));
                             prompt_tokens = prefix_tokens;
                         } else {
-                            prompt_tokens = tokenize(slot.prompt, system_prompt.empty()); // add BOS if there isn't system prompt
+                            prompt_tokens = tokenize(slot.prompt, system_prompt.empty() && add_bos_token);  // add BOS if there isn't system prompt
                         }
 
                         slot.n_past = 0;
@@ -2640,7 +2011,7 @@ struct server_context {
         });
 
         // process the created batch of tokens
-        for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
+        for (int32_t i = 0; i < (int32_t) batch.n_tokens; i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
 
             for (auto & slot : slots) {
@@ -2688,11 +2059,7 @@ struct server_context {
             if (ret != 0) {
                 if (n_batch == 1 || ret < 0) {
                     // if you get here, it means the KV cache is full - try increasing it via the context size
-                    LOG_ERROR("failed to decode the batch: KV cache is full - try increasing it via the context size", {
-                        {"i",   i},
-                        {"n_batch",  ret},
-                        {"ret",   ret},
-                    });
+                    LOG_TEE("%s : failed to decode the batch, n_batch = %d, ret = %d\n", __func__, n_batch, ret);
                     for (auto & slot : slots) {
                         slot.state = SLOT_STATE_PROCESSING;
                         slot.command = SLOT_COMMAND_NONE;
@@ -2702,15 +2069,11 @@ struct server_context {
                     break; // break loop of n_batch
                 }
 
+                LOG_TEE("%s : failed to find free space in the KV cache, retrying with smaller n_batch = %d\n", __func__, n_batch / 2);
+
                 // retry with half the batch size to try to find a free slot in the KV cache
                 n_batch /= 2;
                 i -= n_batch;
-
-                LOG_WARNING("failed to find free space in the KV cache, retrying with smaller batch size - try increasing it via the context size or enable defragmentation", {
-                    {"i",   i},
-                    {"n_batch",  n_batch},
-                    {"ret",   ret},
-                });
 
                 continue; // continue loop of n_batch
             }
@@ -2750,7 +2113,10 @@ struct server_context {
                 }
 
                 for (size_t i = 0; i < std::min(cur_p.size, (size_t) n_probs); ++i) {
-                    result.probs.push_back(cur_p.data[i]);
+                    result.probs.push_back({
+                        cur_p.data[i].id,
+                        cur_p.data[i].p
+                    });
                 }
 
                 if (!process_token(result, slot)) {
@@ -2802,6 +2168,8 @@ static void server_print_usage(const char * argv0, const gpt_params & params, co
     printf("                            KV cache defragmentation threshold (default: %.1f, < 0 - disabled)\n", params.defrag_thold);
     printf("  -b N, --batch-size N      logical maximum batch size (default: %d)\n", params.n_batch);
     printf("  -ub N, --ubatch-size N    physical maximum batch size (default: %d)\n", params.n_ubatch);
+    printf("  --memory-f32              use f32 instead of f16 for memory key+value (default: disabled)\n");
+    printf("                            not recommended: doubles context memory required and no measurable increase in quality\n");
     if (llama_supports_mlock()) {
         printf("  --mlock                   force system to keep model in RAM rather than swapping or compressing\n");
     }
@@ -2824,27 +2192,13 @@ static void server_print_usage(const char * argv0, const gpt_params & params, co
         printf("                            fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1\n");
         printf("  -mg i, --main-gpu i       the GPU to use for the model (with split-mode = none),\n");
         printf("                            or for intermediate results and KV (with split-mode = row)\n");
-        printf("  -nkvo, --no-kv-offload\n");
-        printf("                            disable KV offload\n");
     }
     printf("  -m FNAME, --model FNAME\n");
-    printf("                            model path (default: models/$filename with filename from --hf-file or --model-url if set, otherwise %s)\n", DEFAULT_MODEL_PATH);
-    printf("  -mu MODEL_URL, --model-url MODEL_URL\n");
-    printf("                            model download url (default: unused)\n");
-    printf("  -hfr REPO, --hf-repo REPO\n");
-    printf("                            Hugging Face model repository (default: unused)\n");
-    printf("  -hff FILE, --hf-file FILE\n");
-    printf("                            Hugging Face model file (default: unused)\n");
+    printf("                            model path (default: %s)\n", params.model.c_str());
     printf("  -a ALIAS, --alias ALIAS\n");
     printf("                            set an alias for the model, will be added as `model` field in completion response\n");
     printf("  --lora FNAME              apply LoRA adapter (implies --no-mmap)\n");
     printf("  --lora-base FNAME         optional model to use as a base for the layers modified by the LoRA adapter\n");
-    printf("  --control-vector FNAME\n");
-    printf("                            add a control vector\n");
-    printf("  --control-vector-scaled FNAME S\n");
-    printf("                            add a control vector with user defined scaling S\n");
-    printf("  --control-vector-layer-range START END\n");
-    printf("                        layer range to apply the control vector(s) to, start and end inclusive\n");
     printf("  --host                    ip address to listen (default  (default: %s)\n", sparams.hostname.c_str());
     printf("  --port PORT               port to listen (default  (default: %d)\n", sparams.port);
     printf("  --path PUBLIC_PATH        path from which to serve static files (default: disabled)\n");
@@ -2857,8 +2211,7 @@ static void server_print_usage(const char * argv0, const gpt_params & params, co
     printf("  -to N, --timeout N        server read/write timeout in seconds (default: %d)\n", sparams.read_timeout);
     printf("  --embeddings              enable embedding vector output (default: %s)\n", params.embedding ? "enabled" : "disabled");
     printf("  -np N, --parallel N       number of slots for process requests (default: %d)\n", params.n_parallel);
-    printf("  -cb, --cont-batching      enable continuous batching (a.k.a dynamic batching) (default: enabled)\n");
-    printf("  -fa, --flash-attn         enable Flash Attention (default: %s)\n", params.flash_attn ? "enabled" : "disabled");
+    printf("  -cb, --cont-batching      enable continuous batching (a.k.a dynamic batching) (default: disabled)\n");
     printf("  -spf FNAME, --system-prompt-file FNAME\n");
     printf("                            set a file to load a system prompt (initial prompt of all slots), this is useful for chat applications.\n");
     printf("  -ctk TYPE, --cache-type-k TYPE\n");
@@ -2869,12 +2222,11 @@ static void server_print_usage(const char * argv0, const gpt_params & params, co
     printf("  --log-disable             disables logging to a file.\n");
     printf("  --slots-endpoint-disable  disables slots monitoring endpoint.\n");
     printf("  --metrics                 enable prometheus compatible metrics endpoint (default: %s).\n", sparams.metrics_endpoint ? "enabled" : "disabled");
-    printf("  --slot-save-path PATH     path to save slot kv cache (default: disabled)\n");
     printf("\n");
     printf("  -n, --n-predict           maximum tokens to predict (default: %d)\n", params.n_predict);
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("                            advanced option to override model metadata by key. may be specified multiple times.\n");
-    printf("                            types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false\n");
+    printf("                            types: int, float, bool. example: --override-kv tokenizer.ggml.add_bos_token=bool:false\n");
     printf("  -gan N, --grp-attn-n N    set the group attention factor to extend context size through self-extend(default: 1=disabled), used together with group attention width `--grp-attn-w`\n");
     printf("  -gaw N, --grp-attn-w N    set the group attention width to extend context size through self-extend(default: 512), used together with group attention factor `--grp-attn-n`\n");
     printf("  --chat-template JINJA_TEMPLATE\n");
@@ -2965,24 +2317,6 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                 break;
             }
             params.model = argv[i];
-        } else if (arg == "-mu" || arg == "--model-url") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            params.model_url = argv[i];
-        } else if (arg == "-hfr" || arg == "--hf-repo") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            params.hf_repo = argv[i];
-        } else if (arg == "-hff" || arg == "--hf-file") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            params.hf_file = argv[i];
         } else if (arg == "-a" || arg == "--alias") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -3119,8 +2453,6 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                     "See main README.md for information on enabling GPU BLAS support",
                     {{"n_gpu_layers", params.n_gpu_layers}});
             }
-        } else if (arg == "-nkvo" || arg == "--no-kv-offload") {
-            params.no_kv_offload = true;
         } else if (arg == "--split-mode" || arg == "-sm") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -3137,15 +2469,15 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                 invalid_param = true;
                 break;
             }
-#ifndef GGML_USE_CUDA
-            fprintf(stderr, "warning: llama.cpp was compiled without CUDA. Setting the split mode has no effect.\n");
-#endif // GGML_USE_CUDA
+#ifndef GGML_USE_CUBLAS
+            fprintf(stderr, "warning: llama.cpp was compiled without cuBLAS. Setting the split mode has no effect.\n");
+#endif // GGML_USE_CUBLAS
         } else if (arg == "--tensor-split" || arg == "-ts") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
-#if defined(GGML_USE_CUDA) || defined(GGML_USE_SYCL)
+#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_SYCL)
             std::string arg_next = argv[i];
 
             // split string by , and /
@@ -3162,17 +2494,17 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                 }
             }
 #else
-            LOG_WARNING("llama.cpp was compiled without CUDA. It is not possible to set a tensor split.\n", {});
-#endif // GGML_USE_CUDA
+            LOG_WARNING("llama.cpp was compiled without cuBLAS. It is not possible to set a tensor split.\n", {});
+#endif // GGML_USE_CUBLAS
         } else if (arg == "--main-gpu" || arg == "-mg") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
-#if defined(GGML_USE_CUDA) || defined(GGML_USE_SYCL)
+#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_SYCL)
             params.main_gpu = std::stoi(argv[i]);
 #else
-            LOG_WARNING("llama.cpp was compiled without CUDA. It is not possible to set a main GPU.", {});
+            LOG_WARNING("llama.cpp was compiled without cuBLAS. It is not possible to set a main GPU.", {});
 #endif
         } else if (arg == "--lora") {
             if (++i >= argc) {
@@ -3224,8 +2556,6 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
             params.embedding = true;
         } else if (arg == "-cb" || arg == "--cont-batching") {
             params.cont_batching = true;
-        } else if (arg == "-fa" || arg == "--flash-attn") {
-            params.flash_attn = true;
         } else if (arg == "-np" || arg == "--parallel") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -3280,16 +2610,6 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
             sparams.slots_endpoint = false;
         } else if (arg == "--metrics") {
             sparams.metrics_endpoint = true;
-        } else if (arg == "--slot-save-path") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            sparams.slot_save_path = argv[i];
-            // if doesn't end with DIRECTORY_SEPARATOR, add it
-            if (!sparams.slot_save_path.empty() && sparams.slot_save_path[sparams.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
-                sparams.slot_save_path += DIRECTORY_SEPARATOR;
-            }
         } else if (arg == "--chat-template") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -3302,99 +2622,54 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                 break;
             }
             sparams.chat_template = argv[i];
-        } else if (arg == "--control-vector") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            params.control_vectors.push_back({ 1.0f, argv[i], });
-        } else if (arg == "--control-vector-scaled") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            const char* fname = argv[i];
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            params.control_vectors.push_back({ std::stof(argv[i]), fname, });
-        } else if (arg == "--control-vector-layer-range") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            params.control_vector_layer_start = std::stoi(argv[i]);
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            params.control_vector_layer_end = std::stoi(argv[i]);
-            break;
-        } else if (arg == "--control-vector-option") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            std::string name = argv[i];
-
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            std::string fname = argv[i];
-
-            size_t slen = fname.length();
-            bool is_dir = slen < 5 || strncmp(argv[i] + slen - 5, ".gguf", 5) != 0;
-
-            // Append path separator for dir names
-            if (is_dir && argv[i][slen - 1] != '/')
-                fname += '/';
-            if (is_dir && argv[i-1][slen - 1] != '/')
-                name += '/';
-            if (is_dir) {
-              DIR *dir = opendir(fname.c_str());
-              if (dir == nullptr) {
-                fprintf(stderr, "error: could not read dir: %s\n", fname.c_str());
-              } else {
-                struct dirent* entry;
-                while ((entry = readdir(dir)) != nullptr) {
-                  std::string yomama = fname;
-                  if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                      continue;
-                  }
-                  // Print the name of the entry
-                  size_t yolen = strlen(entry->d_name);
-                  if (yolen >= 5 && strncmp(&entry->d_name[yolen -5 ], ".gguf", 5) == 0) {
-                    entry->d_name[yolen -5] = '\0';
-                    sparams.control_vector_load_options.push_back({ name + entry->d_name, fname + entry->d_name + ".gguf", false });
-                    std::cout << "vector option " << name + entry->d_name << " -> " << fname + entry->d_name << "\n";
-                  }
-                }
-              }
-            } else {
-              sparams.control_vector_load_options.push_back({ name, fname, is_dir });
-                    std::cout << "vector option " << name << " -> " << fname << "\n";
-            }
-            break;
         } else if (arg == "--override-kv") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
-            if (!parse_kv_override(argv[i], params.kv_overrides)) {
+            char * sep = strchr(argv[i], '=');
+            if (sep == nullptr || sep - argv[i] >= 128) {
+                fprintf(stderr, "error: Malformed KV override: %s\n", argv[i]);
+                invalid_param = true;
+                break;
+            }
+
+            struct llama_model_kv_override kvo;
+            std::strncpy(kvo.key, argv[i], sep - argv[i]);
+            kvo.key[sep - argv[i]] = 0;
+            sep++;
+            if (strncmp(sep, "int:", 4) == 0) {
+                sep += 4;
+                kvo.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+                kvo.int_value = std::atol(sep);
+            } else if (strncmp(sep, "float:", 6) == 0) {
+                sep += 6;
+                kvo.tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
+                kvo.float_value = std::atof(sep);
+            } else if (strncmp(sep, "bool:", 5) == 0) {
+                sep += 5;
+                kvo.tag = LLAMA_KV_OVERRIDE_TYPE_BOOL;
+                if (std::strcmp(sep, "true") == 0) {
+                    kvo.bool_value = true;
+                } else if (std::strcmp(sep, "false") == 0) {
+                    kvo.bool_value = false;
+                } else {
+                    fprintf(stderr, "error: Invalid boolean value for KV override: %s\n", argv[i]);
+                    invalid_param = true;
+                    break;
+                }
+            } else {
                 fprintf(stderr, "error: Invalid type for KV override: %s\n", argv[i]);
                 invalid_param = true;
                 break;
             }
+            params.kv_overrides.push_back(kvo);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             server_print_usage(argv[0], default_params, default_sparams);
             exit(1);
         }
     }
-
-    gpt_params_handle_model_default(params);
 
     if (!params.kv_overrides.empty()) {
         params.kv_overrides.emplace_back();
@@ -3837,242 +3112,6 @@ int main(int argc, char ** argv) {
         res.status = 200; // HTTP OK
     };
 
-    const auto handle_slots_save = [&ctx_server, &res_error, &sparams](const httplib::Request & req, httplib::Response & res, int id_slot) {
-        json request_data = json::parse(req.body);
-        std::string filename = request_data["filename"];
-        if (!validate_file_name(filename)) {
-            res_error(res, format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
-            return;
-        }
-        std::string filepath = sparams.slot_save_path + filename;
-
-        server_task task;
-        task.type = SERVER_TASK_TYPE_SLOT_SAVE;
-        task.data = {
-            { "id_slot", id_slot },
-            { "filename", filename },
-            { "filepath", filepath }
-        };
-
-        const int id_task = ctx_server.queue_tasks.post(task);
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
-
-        if (result.error) {
-            res_error(res, result.data);
-        } else {
-            res.set_content(result.data.dump(), "application/json");
-        }
-    };
-
-    const auto handle_slots_restore = [&ctx_server, &res_error, &sparams](const httplib::Request & req, httplib::Response & res, int id_slot) {
-        json request_data = json::parse(req.body);
-        std::string filename = request_data["filename"];
-        if (!validate_file_name(filename)) {
-            res_error(res, format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
-            return;
-        }
-        std::string filepath = sparams.slot_save_path + filename;
-
-        server_task task;
-        task.type = SERVER_TASK_TYPE_SLOT_RESTORE;
-        task.data = {
-            { "id_slot", id_slot },
-            { "filename", filename },
-            { "filepath", filepath }
-        };
-
-        const int id_task = ctx_server.queue_tasks.post(task);
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
-
-        if (result.error) {
-            res_error(res, result.data);
-        } else {
-            res.set_content(result.data.dump(), "application/json");
-        }
-    };
-
-    const auto handle_slots_erase = [&ctx_server, &res_error](const httplib::Request & /* req */, httplib::Response & res, int id_slot) {
-        server_task task;
-        task.type = SERVER_TASK_TYPE_SLOT_ERASE;
-        task.data = {
-            { "id_slot", id_slot },
-        };
-
-        const int id_task = ctx_server.queue_tasks.post(task);
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
-
-        if (result.error) {
-            res_error(res, result.data);
-        } else {
-            res.set_content(result.data.dump(), "application/json");
-        }
-    };
-
-    const auto handle_slots_action = [&res_error, &handle_slots_save, &handle_slots_restore, &handle_slots_erase](const httplib::Request & req, httplib::Response & res) {
-        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
-
-        std::string id_slot_str = req.path_params.at("id_slot");
-        int id_slot;
-
-        try {
-            id_slot = std::stoi(id_slot_str);
-        } catch (const std::exception &) {
-            res_error(res, format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
-            return;
-        }
-
-        std::string action = req.get_param_value("action");
-
-        if (action == "save") {
-            handle_slots_save(req, res, id_slot);
-        } else if (action == "restore") {
-            handle_slots_restore(req, res, id_slot);
-        } else if (action == "erase") {
-            handle_slots_erase(req, res, id_slot);
-        } else {
-            res_error(res, format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
-        }
-    };
-  
-    const auto handle_control_vector_options = [&sparams](const httplib::Request & req, httplib::Response & res) {
-      res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
-      json options = json::array();
-
-      for (const auto & opt : sparams.control_vector_load_options) {
-          options.push_back(opt.name);
-      }
-      res.set_content(options.dump(), "application/json; charset=utf-8");
-    };
-
-    const auto handle_get_control_vectors = [&ctx_server](const httplib::Request & req, httplib::Response & res) {
-      res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
-      json vectors = json::array();
-
-      for (const auto & vec : ctx_server.params.control_vectors) {
-          vectors.push_back(json {
-              { "fname", vec.fname },
-              { "strength", vec.strength }
-          });
-      }
-      json data = {
-          { "vectors", vectors },
-          { "layer_start", ctx_server.params.control_vector_layer_start },
-          { "layer_end", ctx_server.params.control_vector_layer_end }
-      };
-      res.set_content(data.dump(), "application/json; charset=utf-8");
-    };
-
-    const auto handle_set_control_vectors = [&ctx_server, &sparams, &res_error, &handle_get_control_vectors](const httplib::Request & req, httplib::Response & res) {
-        json data = json::parse(req.body);
-
-        // vector parameters passed by user
-        std::vector<llama_control_vector_load_info> vec_params;
-        // names translated to real file names
-        std::vector<llama_control_vector_load_info> real_vec_params;
-
-        if (data.contains("vectors") && data["vectors"].is_array()) {
-            for (const auto &item : data["vectors"]) {
-              llama_control_vector_load_info v = item.get<llama_control_vector_load_info>();
-              //if (v.strength != 0.0f && !std::isnan(v.strength) && !std::isinf(v.strength)) {
-                std::string real_fname = "";
-                //std::cout << "Check vec " << v.fname << "\n";
-                // check for path traversal attempt
-                if (v.fname.length() > 0 && v.fname[0] != '/' && v.fname[0] != '\\') {
-                    if (v.fname.find("../") == -1 && v.fname.find("..\\") == -1 &&
-                        v.fname.find("/..") == -1 && v.fname.find("\\..") == -1) {
-
-                        // check if vector name matches allowed names
-                        for (auto opt : sparams.control_vector_load_options) {
-                            //std::cout << "check option " << opt.name << " : " << opt.fname << " : " << opt.is_dir << "\n";
-                            if (!opt.is_dir && opt.name == v.fname) {
-                                //std::cout << "file exact match\n";
-                                real_fname = opt.fname;
-                                break;
-                            }
-                            if (opt.is_dir && v.fname.rfind(opt.name, 0) == 0) {
-                                //std::cout << "file exact match\n";
-                                real_fname = opt.fname + v.fname.substr(opt.name.length());
-#if defined(_WIN32)
-                                std::replace(real_fname.begin(), real_fname.end(), '/', '\\');
-#endif
-                                size_t len = real_fname.length();
-                                if (len < 5 || real_fname.compare(len - 5, 5, ".gguf") != 0)
-                                    real_fname += ".gguf";
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (real_fname.length() == 0) {
-                    res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
-                    res_error(res, format_error_response("Control vector not allowed", ERROR_TYPE_SERVER));
-                    return;
-                }
-
-                std::cout << "Add vector: " << v.fname << " -> " << real_fname << " " << v.strength << "\n";
-                llama_control_vector_load_info real_info = { v.strength, real_fname };
-                vec_params.push_back(v);
-                real_vec_params.push_back(real_info);
-              }
-            //}
-        } else {
-            std::cerr << "No vectors array passed\n";
-            res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
-            res_error(res, format_error_response("No vectors array passed. If you want reset to 0, send an empty array.", ERROR_TYPE_SERVER));
-            return;
-        }
-
-        //const auto cvec = llama_control_vector_load(real_vec_params);
-        llama_control_vector_load_ensemble(cvec, real_vec_params, vec_params);
-
-        if (cvec.n_embd == -1) {
-            std::cerr << "Could not load control vector\n";
-            res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
-            res_error(res, format_error_response("Could not load control vector", ERROR_TYPE_SERVER));
-            return;
-        }
-
-        if (ctx_server.params.control_vector_layer_start <= 0) {
-            ctx_server.params.control_vector_layer_start = 1;
-        }
-        if (ctx_server.params.control_vector_layer_end   <= 0){
-            ctx_server.params.control_vector_layer_end   = llama_n_layer(ctx_server.model);
-        }
-
-        int err = llama_control_vector_apply_ensemble(ctx_server.ctx,
-                                             &cvec,
-                                             ctx_server.params.control_vector_layer_start,
-                                             ctx_server.params.control_vector_layer_end);
-        if (err) {
-            std::cerr << "Could not apply control vector\n";
-            res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
-            res_error(res, format_error_response("Could not apply control vector", ERROR_TYPE_SERVER));
-            return;
-        }
-
-        ctx_server.params.control_vectors.clear();
-
-        for (auto v : vec_params) {
-          if (v.strength != 0.0f && !std::isnan(v.strength) && !std::isinf(v.strength)) {
-            std::cout << "set vector param: " << v.fname << " " << v.strength << "\n";
-            ctx_server.params.control_vectors.push_back(v);
-          }
-        }
-
-        handle_get_control_vectors(req, res);
-    };
-
-
     const auto handle_props = [&ctx_server](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         json data = {
@@ -4083,6 +3122,46 @@ int main(int argc, char ** argv) {
         };
 
         res.set_content(data.dump(), "application/json; charset=utf-8");
+    };
+
+    const auto handle_loadvector = [&ctx_server, &res_error](const httplib::Request & req, httplib::Response & res) {
+      res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+      json params = json::parse(req.body);
+
+      if (params.count("control_vectors") > 0) {
+        const std::vector<json> p_controlvectors = params["control_vectors"];
+        const std::vector<llama_control_vector_load_info> control_vectors = params["control_vectors"];
+/*        std::string content;
+        if (body.count("tokens") != 0) {
+            const std::vector<llama_token> tokens = body["tokens"];
+            content = tokens_to_str(ctx_server.ctx, tokens.cbegin(), tokens.cend());
+        }
+
+        const json data = format_detokenized_response(content);
+        return res.set_content(data.dump(), "application/json; charset=utf-8");
+*/
+        const auto cvec = llama_control_vector_load(control_vectors);
+        if (cvec.n_embd == -1) {
+          res_error(res, "{ ok: false, err: 1337}");
+          return;
+        }
+
+        int err = llama_control_vector_apply(lctx,
+                                              cvec.data.data(),
+                                              cvec.data.size(),
+                                              cvec.n_embd,
+                                              params["control_vector_layer_start"],
+                                              params["control_vector_layer_end"]);
+        if (err) {
+          char msg[512];
+          sprintf(msg, "{ ok: false, err: %d}", err);
+          res_error(res, msg);
+        } else {
+          res.set_content("{ ok: true }", "application/json; charset=utf-8");
+        }
+      } else {
+        res.set_content("{ ok: true }", "application/json; charset=utf-8");
+      }
     };
 
     const auto handle_completions = [&ctx_server, &res_error](const httplib::Request & req, httplib::Response & res) {
@@ -4424,9 +3503,6 @@ int main(int argc, char ** argv) {
     svr->Get ("/metrics",             handle_metrics);
     svr->Get ("/props",               handle_props);
     svr->Get ("/v1/models",           handle_models);
-    svr->Get ("/control-vectors",         handle_get_control_vectors);
-    svr->Get ("/control-vector-options",  handle_control_vector_options);
-    svr->Post("/control-vectors",         handle_set_control_vectors);
     svr->Post("/completion",          handle_completions); // legacy
     svr->Post("/completions",         handle_completions);
     svr->Post("/v1/completions",      handle_completions);
@@ -4438,10 +3514,7 @@ int main(int argc, char ** argv) {
     svr->Post("/v1/embeddings",       handle_embeddings);
     svr->Post("/tokenize",            handle_tokenize);
     svr->Post("/detokenize",          handle_detokenize);
-    if (!sparams.slot_save_path.empty()) {
-        // only enable slot endpoints if slot_save_path is set
-        svr->Post("/slots/:id_slot",  handle_slots_action);
-    }
+    svr->Post("/loadvector",          handle_loadvector);
 
     //
     // Start the server
@@ -4489,7 +3562,6 @@ int main(int argc, char ** argv) {
     sigemptyset (&sigint_action.sa_mask);
     sigint_action.sa_flags = 0;
     sigaction(SIGINT, &sigint_action, NULL);
-    sigaction(SIGTERM, &sigint_action, NULL);
 #elif defined (_WIN32)
     auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
         return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
