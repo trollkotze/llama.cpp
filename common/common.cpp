@@ -2354,6 +2354,7 @@ std::vector<llama_token> llama_tokenize(
                         bool   parse_special) {
     // upper limit for the number of tokens
     int n_tokens = text.length() + 2 * add_special;
+    printf("Tokenize %d characters.\n", n_tokens);
     std::vector<llama_token> result(n_tokens);
     n_tokens = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
     if (n_tokens < 0) {
