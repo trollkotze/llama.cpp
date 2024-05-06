@@ -12724,9 +12724,7 @@ static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & 
         fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
         if (parse_special) tokenizer_st_partition(vocab, fragment_buffer);
     }
-    printf("Tokenize this shit internally, vocab.type: %d, counting max %d fragments...\n", vocab.type, fragment_buffer.max_size());
-    printf("-> %d\n", std::distance(fragment_buffer.begin(), fragment_buffer.end()));
-    int i = 0;
+
     switch (vocab.type) {
         case LLAMA_VOCAB_TYPE_SPM:
             {
@@ -12774,13 +12772,11 @@ static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & 
         case LLAMA_VOCAB_TYPE_BPE:
             {
                 if (add_special && vocab.special_add_bos != 0) {
-                  printf("add special bos %d\n", vocab.special_bos_id);
                     GGML_ASSERT(vocab.special_bos_id != -1);
                     output.push_back(vocab.special_bos_id);
                 }
 
                 for (const auto & fragment : fragment_buffer) {
-                  printf("fragment %d, type: %d\n", i++, fragment.type);
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         auto raw_text = fragment.raw_text.substr(fragment.offset, fragment.length);
 
@@ -17648,7 +17644,6 @@ int32_t llama_tokenize(
         // LLAMA_LOG_ERROR("%s: too many tokens\n", __func__);
         return -((int) res.size());
     }
-    printf("Copy %d tokens shit for some retarded reason\n", (int) res.size());
 
     for (size_t i = 0; i < res.size(); i++) {
         tokens[i] = res[i];

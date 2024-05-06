@@ -141,14 +141,13 @@ static std::tuple<struct llama_model *, struct llama_context *> llama_init_from_
     }
 
     {
-        printf("warming up the model with an empty run\n");
+        LOG("warming up the model with an empty run\n");
 
         std::vector<llama_token> tmp = { llama_token_bos(model), llama_token_eos(model), };
         llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch), 0, 0));
         llama_kv_cache_clear(lctx);
         llama_synchronize(lctx);
         llama_reset_timings(lctx);
-        printf("warmED up the model with an empty run\n");
     }
 
     return std::make_tuple(model, lctx);
@@ -307,7 +306,7 @@ int main(int argc, char ** argv) {
         params.seed = time(NULL);
     }
 
-    printf("%s: sneed  = %u\n", __func__, params.seed);
+    LOG_TEE("%s: seed  = %u\n", __func__, params.seed);
 
     std::mt19937 rng(params.seed);
     if (params.random_prompt) {
@@ -337,7 +336,6 @@ int main(int argc, char ** argv) {
           eval_callback,
           (void *)&eval_state,
           preloaded);
-      printf("Tied this shit.\n");
       preloaded = model;
 
       if (model == NULL) {
@@ -361,21 +359,20 @@ int main(int argc, char ** argv) {
       }
 
       const bool add_bos = llama_should_add_bos_token(model);
-      printf("add_bos: %d\n", add_bos);
+      LOG("add_bos: %d\n", add_bos);
 
       std::vector<llama_token> embd_inp;
 
-      printf("tokenize the fucking prompt\n");
+      LOG("tokenize the prompt\n");
       embd_inp = ::llama_tokenize(ctx, params.prompt, add_bos, true);
 
-      printf("tokenized the fucking prompt\n");
-      //LOG("prompt: \"%s\"\n", log_tostr(params.prompt));
-      //LOG("tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
+      LOG("prompt: \"%s\"\n", log_tostr(params.prompt));
+      LOG("tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
 
       // Should not run without any tokens
       if (embd_inp.empty()) {
           embd_inp.push_back(llama_token_bos(model));
-          printf("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
+          LOG("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
       }
 
       // number of tokens to keep when resetting context
@@ -385,10 +382,10 @@ int main(int argc, char ** argv) {
           params.n_keep += add_bos; // always keep the BOS token
       }
 
+      if (params.verbose_prompt) {
           LOG_TEE("\n");
           LOG_TEE("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
           LOG_TEE("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
-      if (params.verbose_prompt) {
           for (int i = 0; i < (int) embd_inp.size(); i++) {
               LOG_TEE("%6d -> '%s'\n", embd_inp[i], llama_token_to_piece(ctx, embd_inp[i]).c_str());
           }
@@ -419,9 +416,9 @@ int main(int argc, char ** argv) {
   #endif
       }
 
-      printf("sampling: \n%s\n", llama_sampling_print(sparams).c_str());
-      printf("sampling order: \n%s\n", llama_sampling_order_print(sparams).c_str());
-      printf("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch, params.n_predict, params.n_keep);
+      LOG_TEE("sampling: \n%s\n", llama_sampling_print(sparams).c_str());
+      LOG_TEE("sampling order: \n%s\n", llama_sampling_order_print(sparams).c_str());
+      LOG_TEE("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch, params.n_predict, params.n_keep);
 
       // group-attention state
       // number of grouped KV tokens so far (used only if params.grp_attn_n > 1)
@@ -449,13 +446,12 @@ int main(int argc, char ** argv) {
       std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
       std::ostringstream output_ss;     g_output_ss     = &output_ss;
 
-      printf("Sam Altman is a faggot.\n");
       // the first thing we will do is to output the prompt, so set color accordingly
       console::set_display(console::prompt);
       display = params.display_prompt;
 
       std::vector<llama_token> embd;
-      printf("INIT FUCKING SAMPLING\n");
+
       struct llama_sampling_context * ctx_sampling = llama_sampling_init(sparams);
 
 
@@ -477,11 +473,9 @@ int main(int argc, char ** argv) {
               delim_idxs.push_back(i);
           }
       }
-      printf("Delimited this shit.\n");
 
       // If the last prompt is missing an ending delimiter, add it.
       if (embd_inp.size() > 0 && embd_inp.back() != PROMPT_DELIMITER_TOKEN) {
-        printf("Delimit last prompt for good measure.\n");
           delim_idxs.push_back(embd_inp.size());
           embd_inp.push_back(PROMPT_DELIMITER_TOKEN);
       }
@@ -512,12 +506,9 @@ int main(int argc, char ** argv) {
         fprintf(f, "]");
         fclose(f);
         exit(1);
-      } else {
-        printf("Everything is fine.\n");
       }
       // Set up eval_state
       gguf_context * eval_gguf = gguf_init_empty();
-      printf("GGOOF'd\n");
       {
           int n_embd = llama_n_embd(model);
           int n_layer = llama_n_layer(model);
@@ -536,7 +527,6 @@ int main(int argc, char ** argv) {
           }
           eval_state.first_prompt_idx = -1;
       }
-      printf("eval state built y0\n");
 
 
       // Max tokens to include in a single batch.
@@ -545,7 +535,6 @@ int main(int argc, char ** argv) {
 
       struct llama_batch batch = llama_batch_init(batch_max_tokens, 0, batch_max_seq);
 
-      printf("initialized batch y0\n");
       size_t prompt_idx = 0;
       std::vector<size_t> prev_prompt_start_for_sequence;
       auto last = ggml_time_ms();
@@ -566,7 +555,7 @@ int main(int argc, char ** argv) {
           // Add prompts to the batch until it's full.
           unsigned next_seq = 0;
           while (prompt_idx < num_prompts && next_seq < batch_max_seq) {
-              size_t start = prompt_idx == 0 ? 0 : delim_idxs[prompt_idx - 1]; //prompt_idx == 0 ? 0 : delim_idxs[prompt_idx - 1];// + 1;
+              size_t start = prompt_idx == 0 ? 0 : delim_idxs[prompt_idx - 1] + 1;
               size_t end = delim_idxs[prompt_idx];
               GGML_ASSERT(end > start && "empty prompts are not allowed");
 
@@ -578,7 +567,7 @@ int main(int argc, char ** argv) {
                   size_t prev_start = prev_prompt_start_for_sequence[next_seq];
                   GGML_ASSERT(prev_start <= start);
                   while (start + common < embd_inp.size()
-                          && !(common == 0 && embd_inp[prev_start + common] == PROMPT_DELIMITER_TOKEN)
+                          && embd_inp[prev_start + common] != PROMPT_DELIMITER_TOKEN
                           && embd_inp[start + common] == embd_inp[prev_start + common]
                           ) {
                       ++common;
